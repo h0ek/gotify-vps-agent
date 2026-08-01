@@ -1,0 +1,13 @@
+[Unit]
+Description=Run Gotify VPS Agent periodically
+Documentation=https://github.com/h0ek/gotify-vps-agent
+
+[Timer]
+OnActiveSec=2m
+OnUnitInactiveSec=5m
+AccuracySec=30s
+RandomizedDelaySec=30s
+Unit=gotify-vps-agent.service
+
+[Install]
+WantedBy=timers.target

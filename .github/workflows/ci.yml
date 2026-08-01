@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: 1.26.5
+  GOTOOLCHAIN: local
+  GOFLAGS: -mod=readonly
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: Go format
+        run: test -z "$(gofmt -l $(find . -name '*.go' -type f))"
+      - name: Shell format
+        run: go run mvdan.cc/sh/v3/cmd/shfmt@v3.13.1 -d scripts/*.sh
+      - name: Shell syntax
+        run: bash -n scripts/*.sh
+      - name: ShellCheck
+        run: shellcheck scripts/*.sh
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -count=1 ./...
+      - name: Race detector
+        run: go test -race -count=1 ./...
+      - name: Fuzz config parser
+        run: go test ./internal/config -run=^$ -fuzz=FuzzUnmarshal -fuzztime=5s
+      - name: Fuzz Gotify URL parser
+        run: go test ./internal/gotify -run=^$ -fuzz=FuzzValidateURL -fuzztime=5s
+      - name: Vulnerability scan
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+      - name: Build amd64
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=true -o /tmp/gotify-vps-agent-amd64 ./cmd/gotify-vps-agent
+      - name: Build arm64
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -buildvcs=true -o /tmp/gotify-vps-agent-arm64 ./cmd/gotify-vps-agent

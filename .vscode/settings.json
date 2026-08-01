@@ -1,0 +1,14 @@
+{
+  "[go]": {
+    "editor.defaultFormatter": "golang.go",
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": {
+      "source.organizeImports": "explicit"
+    }
+  },
+  "go.testFlags": [
+    "-count=1"
+  ],
+  "files.trimTrailingWhitespace": true,
+  "files.insertFinalNewline": true
+}

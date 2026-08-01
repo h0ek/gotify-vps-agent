@@ -1,0 +1,4 @@
+/dist/
+*.swp
+*.tmp
+.vscode/*.log

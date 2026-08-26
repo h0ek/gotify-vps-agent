@@ -144,7 +144,7 @@ func RunCheck(ctx context.Context, configPath string, options CheckOptions, outp
 		return fmt.Errorf("read Gotify token: %w", err)
 	}
 	timeout, _ := time.ParseDuration(cfg.Gotify.Timeout)
-	client, err := gotify.New(cfg.Gotify.URL, token, timeout, cfg.Gotify.AllowInsecureHTTP)
+	client, err := gotify.New(cfg.Gotify.URL, token, timeout, cfg.Gotify.AllowInsecureHTTP, cfg.Gotify.ProxyURL)
 	if err != nil {
 		return err
 	}
@@ -175,7 +175,7 @@ func SendTest(ctx context.Context, configPath string) error {
 		return err
 	}
 	timeout, _ := time.ParseDuration(cfg.Gotify.Timeout)
-	client, err := gotify.New(cfg.Gotify.URL, token, timeout, cfg.Gotify.AllowInsecureHTTP)
+	client, err := gotify.New(cfg.Gotify.URL, token, timeout, cfg.Gotify.AllowInsecureHTTP, cfg.Gotify.ProxyURL)
 	if err != nil {
 		return err
 	}
@@ -187,7 +187,7 @@ func SendTestWithValues(ctx context.Context, cfg config.Config, token string) er
 	if err != nil {
 		return err
 	}
-	client, err := gotify.New(cfg.Gotify.URL, token, timeout, cfg.Gotify.AllowInsecureHTTP)
+	client, err := gotify.New(cfg.Gotify.URL, token, timeout, cfg.Gotify.AllowInsecureHTTP, cfg.Gotify.ProxyURL)
 	if err != nil {
 		return err
 	}
@@ -212,6 +212,11 @@ func Status(configPath string, output io.Writer) error {
 	}
 	fmt.Fprintf(output, "Hostname: %s\n", cfg.Agent.Hostname)
 	fmt.Fprintf(output, "Interval: %s\n", cfg.Agent.Interval)
+	if cfg.Gotify.ProxyURL == "" {
+		fmt.Fprintln(output, "SOCKS5 proxy: disabled")
+	} else {
+		fmt.Fprintf(output, "SOCKS5 proxy: %s\n", cfg.Gotify.ProxyURL)
+	}
 	if current.LastRun.IsZero() {
 		fmt.Fprintln(output, "Last run: never")
 	} else {
@@ -285,6 +290,11 @@ func Doctor(ctx context.Context, configPath string) ([]DoctorEntry, bool) {
 		return entries, true
 	}
 	add("PASS", "Configuration", configPath)
+	if cfg.Gotify.ProxyURL == "" {
+		add("PASS", "SOCKS5 proxy", "disabled")
+	} else {
+		add("PASS", "SOCKS5 proxy", cfg.Gotify.ProxyURL)
+	}
 	checkFile(&entries, &failed, "/usr/local/bin/gotify-vps-agent", 0755)
 	checkFile(&entries, &failed, "/usr/local/lib/gotify-vps-agent/uninstall.sh", 0750)
 	checkFile(&entries, &failed, "/etc/systemd/system/gotify-vps-agent.service", 0644)
@@ -382,7 +392,7 @@ func Doctor(ctx context.Context, configPath string) ([]DoctorEntry, bool) {
 	token, tokenErr := config.Token(cfg.Gotify.TokenFile)
 	timeout, timeoutErr := time.ParseDuration(cfg.Gotify.Timeout)
 	if tokenErr == nil && timeoutErr == nil {
-		client, clientErr := gotify.New(cfg.Gotify.URL, token, timeout, cfg.Gotify.AllowInsecureHTTP)
+		client, clientErr := gotify.New(cfg.Gotify.URL, token, timeout, cfg.Gotify.AllowInsecureHTTP, cfg.Gotify.ProxyURL)
 		if clientErr != nil {
 			add("FAIL", "Gotify URL", clientErr.Error())
 		} else if healthErr := client.Health(ctx); healthErr != nil {

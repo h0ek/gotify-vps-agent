@@ -17,8 +17,9 @@ Unofficial community project. Not affiliated with or endorsed by the Gotify proj
 - bounded notification queue with deduplication and backoff
 - service checks for SSH, Nginx, PHP-FPM, MariaDB/MySQL, PostgreSQL and Tor
 - aggregated warnings, critical alerts, reminders and recovery notifications
+- optional local SOCKS5 or SOCKS5H delivery, including Gotify v3 onion services
 
-The agent does not open network ports, accept inbound connections, load plugins or perform automatic remediation. It only sends outbound HTTP(S) requests to the configured Gotify server.
+The agent does not open network ports, accept inbound connections, load plugins or perform automatic remediation. It only sends outbound requests to the configured Gotify server, directly or through an explicitly configured loopback SOCKS5 proxy.
 
 ## Requirements
 
@@ -34,6 +35,12 @@ sudo apt update
 sudo apt install curl needrestart unattended-upgrades
 ```
 
+A local SOCKS5 proxy is optional. A standard local Tor daemon commonly exposes SOCKS on:
+
+```text
+socks5h://127.0.0.1:9050
+```
+
 ## Install
 
 Download and review the installer:
@@ -45,6 +52,8 @@ sudo bash install.sh
 ```
 
 The installer downloads the correct binary, verifies its SHA-256 checksum, configures Gotify, detects supported services, creates an initial baseline and installs the systemd service and timer.
+
+During a new installation, SOCKS5 delivery is disabled by default. When enabled, the suggested proxy is `socks5h://127.0.0.1:9050`.
 
 ## Commands
 
@@ -59,12 +68,50 @@ gotify-vps-agent services
 gotify-vps-agent services detect
 gotify-vps-agent services enable nginx
 gotify-vps-agent services disable nginx
+gotify-vps-agent proxy status
+gotify-vps-agent proxy enable
+gotify-vps-agent proxy disable
 gotify-vps-agent timer sync
 gotify-vps-agent reset-state --yes
 gotify-vps-agent version
 ```
 
 Commands that read or modify protected state require root privileges.
+
+## SOCKS5 and onion services
+
+Enable SOCKS5 interactively on an existing installation:
+
+```bash
+sudo gotify-vps-agent proxy enable
+```
+
+The command asks for the Gotify server URL and the SOCKS5 proxy URL. It sends one test notification before saving. If the test fails, the existing configuration remains unchanged.
+
+Enable it non-interactively:
+
+```bash
+sudo gotify-vps-agent proxy enable \
+  --server http://exampleexampleexampleexampleexampleexampleexample.onion \
+  --proxy socks5h://127.0.0.1:9050
+```
+
+Check the current mode:
+
+```bash
+sudo gotify-vps-agent proxy status
+```
+
+Disable the proxy and optionally switch back to a direct Gotify URL:
+
+```bash
+sudo gotify-vps-agent proxy disable \
+  --server https://gotify.example.com
+```
+
+Only loopback SOCKS5 proxies are accepted. Proxy authentication, remote proxy hosts, paths, query strings and unsupported schemes are rejected. A `.onion` Gotify URL requires SOCKS5 and never falls back to a direct connection.
+
+Plain HTTP remains blocked for non-loopback clearnet targets unless `configure --allow-insecure-http` is used. Plain HTTP is accepted for a valid v3 onion service only when SOCKS5 is enabled.
 
 ## Upgrade
 
@@ -76,6 +123,14 @@ sudo bash install.sh --upgrade
 
 The upgrade preserves the configuration, application token, state, journal cursor, notification queue and timer state.
 
+After upgrading an existing installation to a release with SOCKS5 support:
+
+```bash
+sudo gotify-vps-agent proxy enable
+sudo gotify-vps-agent proxy status
+sudo gotify-vps-agent doctor
+```
+
 ## Build from source
 
 ```bash
@@ -85,7 +140,7 @@ make vet
 make test
 make test-race
 make security
-make build VERSION=0.1.0
+make build VERSION=0.2.0
 ```
 
 Install the local build:
@@ -108,6 +163,17 @@ sudo ./scripts/install.sh --local ./dist/gotify-vps-agent
 
 The application token is stored separately with mode `0600`. It is not placed in command arguments, configuration output or journal messages.
 
+The optional proxy setting is stored in `/etc/gotify-vps-agent/config.toml`:
+
+```toml
+[gotify]
+url = "http://exampleexampleexampleexampleexampleexampleexample.onion"
+token_file = "/etc/gotify-vps-agent/gotify.token"
+timeout = "10s"
+allow_insecure_http = false
+proxy_url = "socks5h://127.0.0.1:9050"
+```
+
 ## Uninstall
 
 Keep configuration and state:
@@ -125,6 +191,8 @@ sudo /usr/local/lib/gotify-vps-agent/uninstall.sh --purge
 ## Security
 
 The agent uses fixed command paths and argument structures, command timeouts, bounded output, strict input parsing, atomically written root-owned files, TLS certificate verification and a hardened systemd service.
+
+SOCKS5 delivery is fail closed. If the local proxy or onion service is unavailable, notifications remain in the bounded queue and are retried later. The agent does not retry the same destination directly.
 
 See [SECURITY.md](SECURITY.md) for vulnerability reporting.
 

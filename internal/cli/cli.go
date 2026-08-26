@@ -18,6 +18,7 @@ import (
 	"github.com/h0ek/gotify-vps-agent/internal/config"
 	"github.com/h0ek/gotify-vps-agent/internal/platform"
 	"github.com/h0ek/gotify-vps-agent/internal/services"
+	"github.com/h0ek/gotify-vps-agent/internal/socksproxy"
 	"github.com/h0ek/gotify-vps-agent/internal/systemd"
 	"github.com/h0ek/gotify-vps-agent/internal/terminal"
 	"github.com/h0ek/gotify-vps-agent/internal/version"
@@ -68,6 +69,8 @@ func (c *CLI) Run(ctx context.Context, args []string) int {
 		}
 	case "services":
 		err = c.services(ctx, configPath, remaining[1:])
+	case "proxy":
+		err = c.proxy(ctx, configPath, remaining[1:])
 	case "timer":
 		err = c.timer(ctx, configPath, remaining[1:])
 	case "reset-state":
@@ -133,6 +136,15 @@ func (c *CLI) configure(ctx context.Context, configPath string, args []string) e
 	cfg.Gotify.URL = c.promptString("Gotify server URL", cfg.Gotify.URL)
 	if *allowHTTP {
 		cfg.Gotify.AllowInsecureHTTP = true
+	}
+	if c.promptYesNo("Use a SOCKS5 proxy for Gotify", cfg.Gotify.ProxyURL != "") {
+		proxyURL := cfg.Gotify.ProxyURL
+		if proxyURL == "" {
+			proxyURL = socksproxy.DefaultURL
+		}
+		cfg.Gotify.ProxyURL = c.promptString("SOCKS5 proxy URL", proxyURL)
+	} else {
+		cfg.Gotify.ProxyURL = ""
 	}
 
 	tokenPrompt := "Application token: "
@@ -239,6 +251,91 @@ func (c *CLI) doctor(ctx context.Context, configPath string) error {
 	}
 	if failed {
 		return fmt.Errorf("doctor found failures")
+	}
+	return nil
+}
+
+func (c *CLI) proxy(ctx context.Context, configPath string, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: proxy status|enable|disable")
+	}
+	command := args[0]
+	if command == "status" {
+		if len(args) != 1 {
+			return fmt.Errorf("usage: proxy status")
+		}
+		cfg, err := config.Load(configPath)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(c.Out, "Gotify server: %s\n", cfg.Gotify.URL)
+		if cfg.Gotify.ProxyURL == "" {
+			fmt.Fprintln(c.Out, "SOCKS5 proxy: disabled")
+		} else {
+			fmt.Fprintf(c.Out, "SOCKS5 proxy: enabled via %s\n", cfg.Gotify.ProxyURL)
+		}
+		return nil
+	}
+	if command != "enable" && command != "disable" {
+		return fmt.Errorf("unknown proxy command %q", command)
+	}
+	if err := platform.RequireDebian13(); err != nil {
+		return err
+	}
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("proxy configuration must run as root")
+	}
+	set := flag.NewFlagSet("proxy "+command, flag.ContinueOnError)
+	set.SetOutput(c.Err)
+	serverURL := set.String("server", "", "Gotify server URL")
+	proxyURL := set.String("proxy", "", "SOCKS5 proxy URL")
+	if err := set.Parse(args[1:]); err != nil {
+		return err
+	}
+	if len(set.Args()) != 0 {
+		return fmt.Errorf("unexpected proxy arguments: %s", strings.Join(set.Args(), " "))
+	}
+	if command == "disable" && *proxyURL != "" {
+		return fmt.Errorf("--proxy is valid only with proxy enable")
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return err
+	}
+	if *serverURL == "" {
+		*serverURL = c.promptString("Gotify server URL", cfg.Gotify.URL)
+	}
+	cfg.Gotify.URL = strings.TrimSpace(*serverURL)
+	if command == "enable" {
+		if *proxyURL == "" {
+			current := cfg.Gotify.ProxyURL
+			if current == "" {
+				current = socksproxy.DefaultURL
+			}
+			*proxyURL = c.promptString("SOCKS5 proxy URL", current)
+		}
+		cfg.Gotify.ProxyURL = strings.TrimSpace(*proxyURL)
+	} else {
+		cfg.Gotify.ProxyURL = ""
+	}
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	token, err := config.Token(cfg.Gotify.TokenFile)
+	if err != nil {
+		return fmt.Errorf("read Gotify token: %w", err)
+	}
+	fmt.Fprintln(c.Out, "Testing Gotify delivery before saving configuration.")
+	if err := app.SendTestWithValues(ctx, cfg, token); err != nil {
+		return fmt.Errorf("Gotify connection test failed; configuration was not changed: %w", err)
+	}
+	if err := app.WriteConfig(configPath, cfg); err != nil {
+		return err
+	}
+	if command == "enable" {
+		fmt.Fprintf(c.Out, "SOCKS5 proxy enabled via %s.\n", cfg.Gotify.ProxyURL)
+	} else {
+		fmt.Fprintln(c.Out, "SOCKS5 proxy disabled.")
 	}
 	return nil
 }
@@ -436,6 +533,9 @@ Commands:
   doctor
   test-notification
   services [list|detect|enable ID|disable ID]
+  proxy status
+  proxy enable [--server URL] [--proxy URL]
+  proxy disable [--server URL]
   timer sync
   reset-state --yes
   version`)

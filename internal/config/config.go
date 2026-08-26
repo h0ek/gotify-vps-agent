@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/h0ek/gotify-vps-agent/internal/socksproxy"
 )
 
 const (
@@ -44,6 +46,7 @@ type Gotify struct {
 	TokenFile         string
 	Timeout           string
 	AllowInsecureHTTP bool
+	ProxyURL          string
 }
 
 type Thresholds struct {
@@ -310,6 +313,10 @@ func assign(cfg *Config, section, key, raw string) error {
 			value, err := boolValue()
 			cfg.Gotify.AllowInsecureHTTP = value
 			return err
+		case "proxy_url":
+			value, err := stringValue()
+			cfg.Gotify.ProxyURL = value
+			return err
 		}
 	case "thresholds":
 		switch key {
@@ -451,6 +458,9 @@ func (cfg Config) Validate() error {
 	if cfg.Gotify.URL == "" {
 		return fmt.Errorf("gotify.url must not be empty")
 	}
+	if _, err := socksproxy.Parse(cfg.Gotify.ProxyURL); err != nil {
+		return err
+	}
 	pairs := [][3]float64{
 		{cfg.Thresholds.DiskWarning, cfg.Thresholds.DiskCritical, 100},
 		{cfg.Thresholds.InodeWarning, cfg.Thresholds.InodeCritical, 100},
@@ -516,6 +526,7 @@ func Marshal(cfg Config) ([]byte, error) {
 	writeString("token_file", cfg.Gotify.TokenFile)
 	writeString("timeout", cfg.Gotify.Timeout)
 	writeBool("allow_insecure_http", cfg.Gotify.AllowInsecureHTTP)
+	writeString("proxy_url", cfg.Gotify.ProxyURL)
 
 	b.WriteString("\n[thresholds]\n")
 	writeFloat("disk_warning", cfg.Thresholds.DiskWarning)

@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/h0ek/gotify-vps-agent/internal/socksproxy"
 	"github.com/h0ek/gotify-vps-agent/internal/textsafe"
 )
 
@@ -33,8 +34,12 @@ type payload struct {
 	Extras   map[string]any `json:"extras,omitempty"`
 }
 
-func New(rawURL, token string, timeout time.Duration, allowInsecureHTTP bool) (*Client, error) {
-	base, err := validateURL(rawURL, allowInsecureHTTP)
+func New(rawURL, token string, timeout time.Duration, allowInsecureHTTP bool, rawProxyURL string) (*Client, error) {
+	proxyURL, err := socksproxy.Parse(rawProxyURL)
+	if err != nil {
+		return nil, err
+	}
+	base, err := validateURL(rawURL, allowInsecureHTTP, proxyURL != nil)
 	if err != nil {
 		return nil, err
 	}
@@ -58,6 +63,9 @@ func New(rawURL, token string, timeout time.Duration, allowInsecureHTTP bool) (*
 		MaxResponseHeaderBytes: 32 * 1024,
 		DisableCompression:     false,
 	}
+	if proxyURL != nil {
+		transport.Proxy = http.ProxyURL(proxyURL)
+	}
 	return &Client{
 		baseURL: base,
 		token:   token,
@@ -71,13 +79,13 @@ func New(rawURL, token string, timeout time.Duration, allowInsecureHTTP bool) (*
 	}, nil
 }
 
-func validateURL(rawURL string, allowInsecureHTTP bool) (*url.URL, error) {
+func validateURL(rawURL string, allowInsecureHTTP, proxyEnabled bool) (*url.URL, error) {
 	base, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil {
 		return nil, fmt.Errorf("parse Gotify URL: %w", err)
 	}
 	if base.Scheme != "https" && base.Scheme != "http" {
-		return nil, fmt.Errorf("Gotify URL must use https")
+		return nil, fmt.Errorf("Gotify URL must use http or https")
 	}
 	if base.Host == "" || base.User != nil || base.RawQuery != "" || base.Fragment != "" || base.Opaque != "" {
 		return nil, fmt.Errorf("Gotify URL contains unsupported components")
@@ -85,8 +93,15 @@ func validateURL(rawURL string, allowInsecureHTTP bool) (*url.URL, error) {
 	if strings.ContainsAny(base.Host, "\r\n\t") {
 		return nil, fmt.Errorf("Gotify URL contains invalid host characters")
 	}
-	if base.Scheme == "http" && !allowInsecureHTTP && !isLoopbackHost(base.Hostname()) {
-		return nil, fmt.Errorf("plain HTTP is allowed only for loopback addresses unless explicitly enabled")
+	onion, err := isOnionHost(base.Hostname())
+	if err != nil {
+		return nil, err
+	}
+	if onion && !proxyEnabled {
+		return nil, fmt.Errorf("Gotify .onion URL requires a SOCKS5 proxy")
+	}
+	if base.Scheme == "http" && !allowInsecureHTTP && !isLoopbackHost(base.Hostname()) && !(onion && proxyEnabled) {
+		return nil, fmt.Errorf("plain HTTP is allowed only for loopback or proxied .onion addresses unless explicitly enabled")
 	}
 	base.Path = strings.TrimRight(base.Path, "/")
 	if base.Path != "" {
@@ -96,6 +111,30 @@ func validateURL(rawURL string, allowInsecureHTTP bool) (*url.URL, error) {
 	}
 	base.RawPath = ""
 	return base, nil
+}
+
+func isOnionHost(host string) (bool, error) {
+	lower := strings.ToLower(host)
+	if strings.HasSuffix(lower, ".onion.") {
+		return false, fmt.Errorf("Gotify onion host must not use a trailing dot")
+	}
+	if !strings.HasSuffix(lower, ".onion") {
+		return false, nil
+	}
+	labels := strings.Split(lower, ".")
+	if len(labels) < 2 || labels[len(labels)-1] != "onion" {
+		return false, fmt.Errorf("Gotify onion host is invalid")
+	}
+	serviceID := labels[len(labels)-2]
+	if len(serviceID) != 56 {
+		return false, fmt.Errorf("Gotify onion host must use a v3 service address")
+	}
+	for _, character := range serviceID {
+		if (character < 'a' || character > 'z') && (character < '2' || character > '7') {
+			return false, fmt.Errorf("Gotify onion host must use a valid v3 service address")
+		}
+	}
+	return true, nil
 }
 
 func validateToken(token string) error {

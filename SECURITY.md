@@ -12,6 +12,6 @@ Include the affected version, reproduction steps, expected impact and suggested 
 
 ## Security scope
 
-The agent opens no listening socket and accepts no inbound network requests. It executes only fixed local commands with fixed argument structures and sends outbound requests only to the administrator-configured Gotify URL.
+The agent opens no listening socket and accepts no inbound network requests. It executes only fixed local commands with fixed argument structures and sends outbound requests only to the administrator-configured Gotify URL. Optional SOCKS5 delivery accepts only an explicitly configured loopback proxy and does not fall back to a direct connection.
 
 The application token grants message-push access to the configured Gotify application. Treat it as a secret and rotate it after suspected disclosure.

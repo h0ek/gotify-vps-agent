@@ -9,6 +9,7 @@ import (
 func TestMarshalRoundTrip(t *testing.T) {
 	original := Default()
 	original.Gotify.URL = "https://gotify.example"
+	original.Gotify.ProxyURL = "socks5h://127.0.0.1:9050"
 	original.Services = map[string]string{
 		"nginx":   "nginx.service",
 		"php-fpm": "php8.4-fpm.service",
@@ -92,6 +93,33 @@ func TestValidateRejectsNonFiniteThresholds(t *testing.T) {
 		if err := cfg.Validate(); err == nil {
 			t.Fatalf("expected threshold %q to be rejected", value)
 		}
+	}
+}
+
+func TestValidateRejectsUnsafeProxyURL(t *testing.T) {
+	for _, value := range []string{
+		"http://127.0.0.1:9050",
+		"socks5h://192.0.2.10:9050",
+		"socks5h://user:pass@127.0.0.1:9050",
+		"socks5h://127.0.0.1",
+	} {
+		cfg := Default()
+		cfg.Gotify.URL = "https://gotify.example"
+		cfg.Gotify.ProxyURL = value
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("expected proxy URL %q to be rejected", value)
+		}
+	}
+}
+
+func TestUnmarshalLegacyConfigWithoutProxy(t *testing.T) {
+	cfg := Default()
+	data := []byte("version = 1\n[gotify]\nurl = \"https://gotify.example\"\n")
+	if err := Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Gotify.ProxyURL != "" {
+		t.Fatalf("unexpected proxy URL: %q", cfg.Gotify.ProxyURL)
 	}
 }
 

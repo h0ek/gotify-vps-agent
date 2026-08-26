@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GO_VERSION: 1.26.5
+  GO_VERSION: 1.26.7
   GOTOOLCHAIN: local
   GOFLAGS: -mod=readonly
 

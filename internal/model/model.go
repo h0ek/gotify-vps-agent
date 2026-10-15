@@ -16,11 +16,12 @@ const (
 )
 
 type Result struct {
-	ID        string `json:"id"`
-	Title     string `json:"title"`
-	Status    Status `json:"status"`
-	Message   string `json:"message"`
-	Immediate bool   `json:"immediate,omitempty"`
+	ID         string `json:"id"`
+	Title      string `json:"title"`
+	Status     Status `json:"status"`
+	Message    string `json:"message"`
+	Immediate  bool   `json:"immediate,omitempty"`
+	Occurrence string `json:"occurrence,omitempty"`
 }
 
 type EventKind string
@@ -30,6 +31,7 @@ const (
 	EventEscalation EventKind = "escalation"
 	EventRecovery   EventKind = "recovery"
 	EventReminder   EventKind = "reminder"
+	EventOccurrence EventKind = "occurrence"
 )
 
 type Event struct {
@@ -44,6 +46,9 @@ type Event struct {
 
 func (r Result) Fingerprint() string {
 	value := fmt.Sprintf("%s\x00%s\x00%s", r.ID, r.Status, strings.TrimSpace(r.Message))
+	if r.Occurrence != "" {
+		value += "\x00" + r.Occurrence
+	}
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])
 }

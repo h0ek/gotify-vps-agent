@@ -3,6 +3,8 @@ package checks
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -17,6 +19,7 @@ import (
 	"github.com/h0ek/gotify-vps-agent/internal/config"
 	"github.com/h0ek/gotify-vps-agent/internal/model"
 	"github.com/h0ek/gotify-vps-agent/internal/runner"
+	"github.com/h0ek/gotify-vps-agent/internal/systemd"
 	"github.com/h0ek/gotify-vps-agent/internal/textsafe"
 )
 
@@ -31,6 +34,7 @@ type filesystemUsage struct {
 	Mount     mount
 	DiskUsed  float64
 	InodeUsed float64
+	Err       error
 }
 
 type RunOutput struct {
@@ -39,9 +43,15 @@ type RunOutput struct {
 }
 
 type journalSnapshot struct {
-	Output string
+	Output  string
+	Cursor  string
+	Err     error
+	Entries []journalEntry
+}
+
+type journalEntry struct {
 	Cursor string
-	Err    error
+	Line   string
 }
 
 func Run(ctx context.Context, cfg config.Config, lastRun time.Time) RunOutput {
@@ -120,6 +130,9 @@ func checkSystemdFailed(ctx context.Context) model.Result {
 	if err != nil {
 		return problem("systemd.failed", "Failed systemd units", model.StatusWarning, err.Error(), false)
 	}
+	if result.ExitCode != 0 || result.Truncated {
+		return problem("systemd.failed", "Failed systemd units", model.StatusWarning, "Unable to inspect failed units: "+compactOutput(result.Output), false)
+	}
 	lines := nonEmptyLines(result.Output)
 	if len(lines) == 0 {
 		return ok("systemd.failed", "Failed systemd units", "No failed systemd units")
@@ -134,7 +147,11 @@ func inspectFilesystems(mounts []mount) []filesystemUsage {
 	values := make([]filesystemUsage, 0, len(mounts))
 	for _, item := range mounts {
 		var stat syscall.Statfs_t
-		if err := syscall.Statfs(item.Path, &stat); err != nil || stat.Blocks == 0 {
+		if err := syscall.Statfs("/proc/1/root"+item.Path, &stat); err != nil {
+			values = append(values, filesystemUsage{Mount: item, Err: err})
+			continue
+		}
+		if stat.Blocks == 0 {
 			continue
 		}
 		diskUsed := float64(stat.Blocks-stat.Bavail) / float64(stat.Blocks) * 100
@@ -234,6 +251,11 @@ func checkDisk(values []filesystemUsage, cfg config.Config) model.Result {
 	issues := make([]string, 0)
 	worst := values[0]
 	for _, value := range values {
+		if value.Err != nil {
+			status = higher(status, model.StatusWarning)
+			issues = append(issues, fmt.Sprintf("%s could not be inspected: %v", value.Mount.Path, value.Err))
+			continue
+		}
 		if value.DiskUsed > worst.DiskUsed {
 			worst = value
 		}
@@ -257,6 +279,11 @@ func checkInode(values []filesystemUsage, cfg config.Config) model.Result {
 	issues := make([]string, 0)
 	worst := values[0]
 	for _, value := range values {
+		if value.Err != nil {
+			status = higher(status, model.StatusWarning)
+			issues = append(issues, fmt.Sprintf("%s could not be inspected: %v", value.Mount.Path, value.Err))
+			continue
+		}
 		if value.InodeUsed > worst.InodeUsed {
 			worst = value
 		}
@@ -314,8 +341,8 @@ func readMemInfo() map[string]uint64 {
 
 func checkMemory(values map[string]uint64, cfg config.Config) model.Result {
 	total := values["MemTotal"]
-	available := values["MemAvailable"]
-	if total == 0 {
+	available, availableOK := values["MemAvailable"]
+	if total == 0 || !availableOK || available > total {
 		return problem("memory.available", "Available memory", model.StatusWarning, "Unable to read /proc/meminfo", false)
 	}
 	percent := float64(available) / float64(total) * 100
@@ -333,8 +360,11 @@ func checkMemory(values map[string]uint64, cfg config.Config) model.Result {
 }
 
 func checkSwap(values map[string]uint64, cfg config.Config) model.Result {
-	total := values["SwapTotal"]
-	free := values["SwapFree"]
+	total, totalOK := values["SwapTotal"]
+	free, freeOK := values["SwapFree"]
+	if !totalOK || !freeOK || free > total {
+		return problem("memory.swap", "Swap usage", model.StatusWarning, "Unable to read valid swap data from /proc/meminfo", false)
+	}
 	if total == 0 {
 		return ok("memory.swap", "Swap usage", "Swap is not configured")
 	}
@@ -356,7 +386,27 @@ func checkOOM(journal journalSnapshot) model.Result {
 	if len(matches) == 0 {
 		return ok("memory.oom", "OOM kills", "No new OOM events")
 	}
-	return problem("memory.oom", "OOM kills", model.StatusCritical, joinLimited(matches, 4), true)
+	return journalProblem("memory.oom", "OOM kills", journal, matches)
+}
+
+func journalProblem(id, title string, journal journalSnapshot, matches []string) model.Result {
+	identities := make([]string, 0, len(matches))
+	matched := make(map[string]bool, len(matches))
+	for _, line := range matches {
+		matched[line] = true
+	}
+	for _, entry := range journal.Entries {
+		if matched[entry.Line] {
+			identities = append(identities, entry.Cursor)
+		}
+	}
+	if len(identities) == 0 {
+		identities = append(identities, journal.Cursor, strings.Join(matches, "\n"))
+	}
+	sum := sha256.Sum256([]byte(strings.Join(identities, "\x00")))
+	result := problem(id, title, model.StatusCritical, joinLimited(matches, 4), true)
+	result.Occurrence = fmt.Sprintf("%x", sum)
+	return result
 }
 
 func checkLoad(cfg config.Config) model.Result {
@@ -408,10 +458,14 @@ func checkKernelErrors(journal journalSnapshot) model.Result {
 	if len(matches) == 0 {
 		return ok("kernel.errors", "Kernel and block-device errors", "No new matching kernel errors")
 	}
-	return problem("kernel.errors", "Kernel and block-device errors", model.StatusCritical, joinLimited(matches, 4), true)
+	return journalProblem("kernel.errors", "Kernel and block-device errors", journal, matches)
 }
 
 func collectKernelJournal(ctx context.Context, cursorPath string, lastRun time.Time) journalSnapshot {
+	return collectKernelJournalWithRunner(ctx, cursorPath, lastRun, runner.Run)
+}
+
+func collectKernelJournalWithRunner(ctx context.Context, cursorPath string, lastRun time.Time, run func(context.Context, time.Duration, string, ...string) (runner.Result, error)) journalSnapshot {
 	cursorData, err := os.ReadFile(cursorPath)
 	cursor := strings.TrimSpace(string(cursorData))
 	if err != nil && !os.IsNotExist(err) {
@@ -421,7 +475,7 @@ func collectKernelJournal(ctx context.Context, cursorPath string, lastRun time.T
 		return journalSnapshot{Err: fmt.Errorf("invalid journal cursor: %w", err)}
 	}
 
-	baseArgs := []string{"--quiet", "--no-pager", "--output=short-iso", "--lines=2000", "--show-cursor"}
+	baseArgs := []string{"--quiet", "--no-pager", "--all", "--output=json", "--output-fields=__CURSOR,__REALTIME_TIMESTAMP,MESSAGE", "--show-cursor"}
 	args := append([]string{}, baseArgs...)
 	if cursor != "" {
 		args = append(args, "--after-cursor="+cursor)
@@ -433,12 +487,9 @@ func collectKernelJournal(ctx context.Context, cursorPath string, lastRun time.T
 	}
 	args = append(args, "_TRANSPORT=kernel")
 
-	result, runErr := runner.Run(ctx, 15*time.Second, "/usr/bin/journalctl", args...)
+	result, runErr := collectJournalPage(ctx, args, run)
 	if runErr != nil {
 		return journalSnapshot{Err: runErr}
-	}
-	if result.Truncated {
-		return journalSnapshot{Err: fmt.Errorf("journal output exceeded the safe collection limit")}
 	}
 	if result.ExitCode != 0 && cursor != "" {
 		if lastRun.IsZero() {
@@ -446,23 +497,31 @@ func collectKernelJournal(ctx context.Context, cursorPath string, lastRun time.T
 		}
 		fallback := append([]string{}, baseArgs...)
 		fallback = append(fallback, "--since", "@"+strconv.FormatInt(lastRun.Unix(), 10), "_TRANSPORT=kernel")
-		result, runErr = runner.Run(ctx, 15*time.Second, "/usr/bin/journalctl", fallback...)
+		result, runErr = collectJournalPage(ctx, fallback, run)
 		if runErr != nil {
 			return journalSnapshot{Err: runErr}
 		}
-		if result.Truncated {
-			return journalSnapshot{Err: fmt.Errorf("journal output exceeded the safe collection limit")}
-		}
+		cursor = ""
 	}
 	if result.ExitCode != 0 {
 		return journalSnapshot{Err: fmt.Errorf("journalctl failed: %s", result.Output)}
 	}
 
-	output, newCursor := parseJournalOutput(result.Output, cursor)
-	if err := validateJournalCursor(newCursor); err != nil {
-		return journalSnapshot{Err: fmt.Errorf("journalctl returned an invalid cursor: %w", err)}
+	return parseJournalOutput(result.Output, cursor)
+}
+
+func collectJournalPage(ctx context.Context, args []string, run func(context.Context, time.Duration, string, ...string) (runner.Result, error)) (runner.Result, error) {
+	for limit := 2000; limit >= 1; limit = max(1, limit/2) {
+		limitedArgs := append(append([]string{}, args...), "--lines=+"+strconv.Itoa(limit))
+		result, err := run(ctx, 15*time.Second, "/usr/bin/journalctl", limitedArgs...)
+		if err != nil || !result.Truncated {
+			return result, err
+		}
+		if limit == 1 {
+			return runner.Result{}, fmt.Errorf("a journal entry exceeded the safe collection limit; cursor was not advanced")
+		}
 	}
-	return journalSnapshot{Output: output, Cursor: newCursor}
+	return runner.Result{}, fmt.Errorf("journal collection failed")
 }
 
 func validateJournalCursor(cursor string) error {
@@ -480,21 +539,50 @@ func validateJournalCursor(cursor string) error {
 	return nil
 }
 
-func parseJournalOutput(output, currentCursor string) (string, string) {
+func parseJournalOutput(output, currentCursor string) journalSnapshot {
 	lines := strings.Split(output, "\n")
-	newCursor := currentCursor
+	snapshot := journalSnapshot{Cursor: currentCursor}
 	kept := make([]string, 0, len(lines))
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "-- cursor: ") {
-			newCursor = strings.TrimSpace(strings.TrimPrefix(trimmed, "-- cursor: "))
 			continue
 		}
 		if trimmed != "" {
-			kept = append(kept, line)
+			var entry struct {
+				Cursor    string          `json:"__CURSOR"`
+				Timestamp string          `json:"__REALTIME_TIMESTAMP"`
+				Message   json.RawMessage `json:"MESSAGE"`
+			}
+			if err := json.Unmarshal([]byte(trimmed), &entry); err != nil {
+				return journalSnapshot{Err: fmt.Errorf("journalctl returned invalid JSON")}
+			}
+			if entry.Cursor == "" || validateJournalCursor(entry.Cursor) != nil {
+				return journalSnapshot{Err: fmt.Errorf("journalctl returned an invalid entry cursor")}
+			}
+			var message string
+			if len(entry.Message) == 0 || string(entry.Message) == "null" {
+				return journalSnapshot{Err: fmt.Errorf("journalctl returned an unavailable message")}
+			}
+			if err := json.Unmarshal(entry.Message, &message); err != nil {
+				var binary []byte
+				if err := json.Unmarshal(entry.Message, &binary); err != nil {
+					return journalSnapshot{Err: fmt.Errorf("journalctl returned an invalid message")}
+				}
+				message = string(binary)
+			}
+			timestamp, err := strconv.ParseInt(entry.Timestamp, 10, 64)
+			if err != nil {
+				return journalSnapshot{Err: fmt.Errorf("journalctl returned an invalid timestamp")}
+			}
+			rendered := time.UnixMicro(timestamp).UTC().Format(time.RFC3339Nano) + " " + strings.Join(nonEmptyLines(message), " ")
+			kept = append(kept, rendered)
+			snapshot.Entries = append(snapshot.Entries, journalEntry{Cursor: entry.Cursor, Line: rendered})
+			snapshot.Cursor = entry.Cursor
 		}
 	}
-	return strings.Join(kept, "\n"), newCursor
+	snapshot.Output = strings.Join(kept, "\n")
+	return snapshot
 }
 
 func checkAPT(ctx context.Context) model.Result {
@@ -644,17 +732,14 @@ func checkTimeSync(ctx context.Context) model.Result {
 }
 
 func checkAgentTimer(ctx context.Context) model.Result {
-	load := systemctlProperty(ctx, "gotify-vps-agent.timer", "LoadState")
-	active := systemctlState(ctx, "is-active", "gotify-vps-agent.timer")
-	enabled := systemctlState(ctx, "is-enabled", "gotify-vps-agent.timer")
-	nextRealtime := systemctlProperty(ctx, "gotify-vps-agent.timer", "NextElapseUSecRealtime")
-	nextMonotonic := systemctlProperty(ctx, "gotify-vps-agent.timer", "NextElapseUSecMonotonic")
-	scheduled := nextRealtime != "" && nextRealtime != "0" && nextRealtime != "n/a"
-	scheduled = scheduled || (nextMonotonic != "" && nextMonotonic != "0" && nextMonotonic != "n/a")
-	if load == "loaded" && active == "active" && enabled == "enabled" && scheduled {
-		return ok("agent.timer", "Agent timer", "gotify-vps-agent.timer is active, enabled and scheduled")
+	result, err := runner.Run(ctx, 10*time.Second, "/usr/bin/systemctl", "show", "gotify-vps-agent.timer", "--property=LoadState,ActiveState,SubState,UnitFileState,NextElapseUSecRealtime,NextElapseUSecMonotonic")
+	if err != nil {
+		return problem("agent.timer", "Agent timer", model.StatusWarning, err.Error(), false)
 	}
-	return problem("agent.timer", "Agent timer", model.StatusWarning, fmt.Sprintf("load=%s active=%s enabled=%s scheduled=%t", load, active, enabled, scheduled), false)
+	if result.ExitCode == 0 && !result.Truncated && systemd.TimerHealthy(result.Output) {
+		return ok("agent.timer", "Agent timer", "gotify-vps-agent.timer is active, enabled and operational")
+	}
+	return problem("agent.timer", "Agent timer", model.StatusWarning, compactOutput(result.Output), false)
 }
 
 func DeliveryQueue(queued, attempts int, oldest time.Time) model.Result {
@@ -681,7 +766,7 @@ func checkAgentFreshness(cfg config.Config, lastRun time.Time) model.Result {
 		return problem("agent.freshness", "Agent execution freshness", model.StatusCritical, fmt.Sprintf("Previous completed run was %s ago", humanDuration(age)), true)
 	}
 	if age > interval*3 {
-		return problem("agent.freshness", "Agent execution freshness", model.StatusWarning, fmt.Sprintf("Previous completed run was %s ago", humanDuration(age)), false)
+		return problem("agent.freshness", "Agent execution freshness", model.StatusWarning, fmt.Sprintf("Previous completed run was %s ago", humanDuration(age)), true)
 	}
 	return ok("agent.freshness", "Agent execution freshness", fmt.Sprintf("Previous completed run was %s ago", humanDuration(age)))
 }
@@ -725,7 +810,14 @@ func checkPostgreSQL(ctx context.Context, unit string) model.Result {
 	if result.ExitCode != 0 {
 		return problem("service.postgresql", "PostgreSQL service", model.StatusWarning, compactOutput(result.Output), false)
 	}
-	lines := nonEmptyLines(result.Output)
+	if result.Truncated {
+		return problem("service.postgresql", "PostgreSQL service", model.StatusWarning, "Cluster status output exceeded the safe collection limit", false)
+	}
+	return postgreSQLStatus(result.Output)
+}
+
+func postgreSQLStatus(output string) model.Result {
+	lines := nonEmptyLines(output)
 	if len(lines) == 0 {
 		return problem("service.postgresql", "PostgreSQL service", model.StatusWarning, "No PostgreSQL clusters were found", false)
 	}
@@ -736,7 +828,7 @@ func checkPostgreSQL(ctx context.Context, unit string) model.Result {
 			offline = append(offline, line)
 			continue
 		}
-		if fields[3] != "online" {
+		if strings.Split(fields[3], ",")[0] != "online" {
 			offline = append(offline, strings.Join(fields[:4], " "))
 		}
 	}

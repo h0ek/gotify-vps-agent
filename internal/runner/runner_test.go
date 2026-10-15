@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +22,17 @@ func TestRunTimesOut(t *testing.T) {
 	_, err := Run(context.Background(), 20*time.Millisecond, "/usr/bin/sleep", "1")
 	if err == nil || !strings.Contains(err.Error(), "timed out") {
 		t.Fatalf("expected timeout, got %v", err)
+	}
+}
+
+func TestRunPropagatesCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	timer := time.AfterFunc(30*time.Millisecond, cancel)
+	defer timer.Stop()
+	_, err := Run(ctx, time.Second, "/usr/bin/sleep", "1")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled command was not propagated: %v", err)
 	}
 }
 

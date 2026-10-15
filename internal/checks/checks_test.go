@@ -1,6 +1,8 @@
 package checks
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,23 +10,33 @@ import (
 	"time"
 
 	"github.com/h0ek/gotify-vps-agent/internal/config"
+	"github.com/h0ek/gotify-vps-agent/internal/engine"
 	"github.com/h0ek/gotify-vps-agent/internal/model"
+	"github.com/h0ek/gotify-vps-agent/internal/runner"
+	"github.com/h0ek/gotify-vps-agent/internal/state"
 )
 
 func TestParseJournalOutput(t *testing.T) {
-	output, cursor := parseJournalOutput("line one\nline two\n-- cursor: s=abc123\n", "s=old")
-	if output != "line one\nline two" {
-		t.Fatalf("unexpected output: %q", output)
-	}
-	if cursor != "s=abc123" {
-		t.Fatalf("unexpected cursor: %q", cursor)
+	snapshot := parseJournalOutput(`{"__CURSOR":"s=first","__REALTIME_TIMESTAMP":"1000000","MESSAGE":"line one"}
+{"__CURSOR":"s=second","__REALTIME_TIMESTAMP":"2000000","MESSAGE":"line two"}
+-- cursor: s=second`, "s=old")
+	if snapshot.Err != nil || snapshot.Cursor != "s=second" || len(snapshot.Entries) != 2 || !strings.Contains(snapshot.Output, "line two") {
+		t.Fatalf("unexpected journal snapshot: %#v", snapshot)
 	}
 }
 
 func TestParseJournalOutputKeepsExistingCursor(t *testing.T) {
-	output, cursor := parseJournalOutput("", "s=old")
-	if output != "" || cursor != "s=old" {
-		t.Fatalf("unexpected result: output=%q cursor=%q", output, cursor)
+	snapshot := parseJournalOutput("", "s=old")
+	if snapshot.Err != nil || snapshot.Output != "" || snapshot.Cursor != "s=old" {
+		t.Fatalf("unexpected empty journal snapshot: %#v", snapshot)
+	}
+}
+
+func TestParseJournalOutputRejectsIncompleteRecords(t *testing.T) {
+	for _, output := range []string{`{"MESSAGE":"event"}`, `{"__CURSOR":"s=1","MESSAGE":"event"}`, `{"__CURSOR":"s=1","__REALTIME_TIMESTAMP":"1000000",`, `not JSON`} {
+		if snapshot := parseJournalOutput(output, "s=old"); snapshot.Err == nil || snapshot.Cursor != "" {
+			t.Fatalf("incomplete output advanced cursor: %#v", snapshot)
+		}
 	}
 }
 
@@ -67,6 +79,23 @@ func TestAgentFreshness(t *testing.T) {
 	}
 	if result := checkAgentFreshness(cfg, time.Now().Add(-40*time.Minute)); result.Status != model.StatusCritical {
 		t.Fatalf("unexpected critical status: %s", result.Status)
+	}
+}
+
+func TestFreshnessWarningSurvivesNextSuccessfulRun(t *testing.T) {
+	cfg := config.Default()
+	value := state.New()
+	result := checkAgentFreshness(cfg, time.Now().Add(-20*time.Minute))
+	events := engine.Evaluate(&value, []model.Result{result}, cfg, time.Now())
+	if len(events) != 1 || events[0].Status != model.StatusWarning {
+		t.Fatalf("one-off execution gap was suppressed: %#v", events)
+	}
+}
+
+func TestSwapDoesNotReportMissingMemInfoAsHealthy(t *testing.T) {
+	result := checkSwap(nil, config.Default())
+	if result.Status != model.StatusWarning {
+		t.Fatalf("missing swap data reported as healthy: %#v", result)
 	}
 }
 
@@ -133,4 +162,95 @@ func TestCheckReadOnlyReportsHostReadOnlyMount(t *testing.T) {
 	if result.Status != model.StatusCritical || result.Message != "/srv" {
 		t.Fatalf("unexpected result: %+v", result)
 	}
+}
+
+func TestJournalCollectorReducesOversizedPages(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "journal.cursor")
+	calls := 0
+	run := func(_ context.Context, _ time.Duration, _ string, args ...string) (runner.Result, error) {
+		calls++
+		joined := strings.Join(args, " ")
+		if !strings.Contains(joined, "--lines=+500") {
+			return runner.Result{Truncated: true}, nil
+		}
+		return runner.Result{Output: `{"__CURSOR":"s=entry","__REALTIME_TIMESTAMP":"1000000","MESSAGE":"Out of memory: killed process 123"}`}, nil
+	}
+	snapshot := collectKernelJournalWithRunner(context.Background(), path, time.Now(), run)
+	if snapshot.Err != nil || calls != 3 || snapshot.Cursor != "s=entry" || checkOOM(snapshot).Occurrence == "" {
+		t.Fatalf("oversized page did not make progress: calls=%d snapshot=%#v", calls, snapshot)
+	}
+}
+
+func TestJournalCollectorDoesNotAdvancePastOversizedEntry(t *testing.T) {
+	run := func(context.Context, time.Duration, string, ...string) (runner.Result, error) {
+		return runner.Result{Truncated: true}, nil
+	}
+	snapshot := collectKernelJournalWithRunner(context.Background(), filepath.Join(t.TempDir(), "journal.cursor"), time.Now(), run)
+	if snapshot.Err == nil || snapshot.Cursor != "" {
+		t.Fatalf("oversized entry was acknowledged: %#v", snapshot)
+	}
+}
+
+func TestPostgreSQLRecoveryClusterIsOnline(t *testing.T) {
+	for _, status := range []string{"online", "online,recovery"} {
+		result := postgreSQLStatus("17 main 5432 " + status + " postgres /var/lib/postgresql/17/main /var/log/postgresql/postgresql-17-main.log")
+		if result.Status != model.StatusOK {
+			t.Fatalf("healthy cluster reported as failed: %#v", result)
+		}
+	}
+	if result := postgreSQLStatus("17 main 5432 down postgres /data /log"); result.Status != model.StatusCritical {
+		t.Fatalf("offline cluster reported as healthy: %#v", result)
+	}
+}
+
+func TestInvalidMemoryDataIsWarning(t *testing.T) {
+	for _, values := range []map[string]uint64{nil, {"MemTotal": 1024}, {"MemTotal": 1024, "MemAvailable": 2048}} {
+		if result := checkMemory(values, config.Default()); result.Status != model.StatusWarning {
+			t.Fatalf("invalid memory data was accepted: %#v", result)
+		}
+	}
+}
+
+func TestInaccessibleFilesystemDoesNotBecomeHealthy(t *testing.T) {
+	values := []filesystemUsage{{Mount: mount{Path: "/"}, DiskUsed: 20, InodeUsed: 10}, {Mount: mount{Path: "/home"}, Err: os.ErrPermission}}
+	cfg := config.Default()
+	for _, result := range []model.Result{checkDisk(values, cfg), checkInode(values, cfg)} {
+		if result.Status != model.StatusWarning || !strings.Contains(result.Message, "/home could not be inspected") {
+			t.Fatalf("inaccessible filesystem was silently skipped: %#v", result)
+		}
+	}
+	values[0].DiskUsed = 99
+	values[0].InodeUsed = 99
+	for _, result := range []model.Result{checkDisk(values, cfg), checkInode(values, cfg)} {
+		if result.Status != model.StatusCritical {
+			t.Fatalf("inspection failure masked a full filesystem: %#v", result)
+		}
+	}
+}
+
+func TestInspectFilesystemsReadsHostMountsAndReportsFailures(t *testing.T) {
+	values := inspectFilesystems([]mount{{Path: "/"}, {Path: "/gotify-vps-agent-test-nonexistent-mount"}})
+	if len(values) != 2 {
+		t.Fatalf("filesystem inspection silently dropped a mount: %#v", values)
+	}
+	for _, value := range values {
+		if value.Mount.Path == "/" && value.Err != nil && !errors.Is(value.Err, os.ErrPermission) {
+			t.Fatalf("host root filesystem could not be inspected: %v", value.Err)
+		}
+		if value.Mount.Path != "/" && value.Err == nil {
+			t.Fatal("missing mount did not return an inspection failure")
+		}
+	}
+}
+
+func FuzzParseJournalOutput(f *testing.F) {
+	f.Add(`{"__CURSOR":"s=entry","__REALTIME_TIMESTAMP":"1000000","MESSAGE":"Out of memory"}`)
+	f.Add(`{"__CURSOR":"s=binary","__REALTIME_TIMESTAMP":"1000000","MESSAGE":[65,66,255]}`)
+	f.Add("")
+	f.Fuzz(func(t *testing.T, value string) {
+		if len(value) > 1024*1024 {
+			t.Skip()
+		}
+		_ = parseJournalOutput(value, "s=previous")
+	})
 }

@@ -2,6 +2,19 @@ package services
 
 import "testing"
 
+func TestInstalledPackageStatus(t *testing.T) {
+	for _, output := range []string{"ii ", "ii", "ii \n"} {
+		if !installedStatus(output) {
+			t.Fatalf("installed package rejected: %q", output)
+		}
+	}
+	for _, output := range []string{"rc ", "iU ", "iiR", "", "unknown"} {
+		if installedStatus(output) {
+			t.Fatalf("uninstalled or broken package accepted: %q", output)
+		}
+	}
+}
+
 func TestProfilesAreUniqueAndSupported(t *testing.T) {
 	seen := map[string]bool{}
 	for _, profile := range Profiles() {

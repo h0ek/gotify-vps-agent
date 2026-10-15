@@ -21,6 +21,18 @@ Unofficial community project. Not affiliated with or endorsed by the Gotify proj
 
 The agent does not open network ports, accept inbound connections, load plugins or perform automatic remediation. It only sends outbound requests to the configured Gotify server, directly or through an explicitly configured loopback SOCKS5 proxy.
 
+By default, warnings and non-immediate critical conditions require two consecutive failing checks. Selected critical conditions, such as an inactive monitored service, and missed execution intervals notify immediately. Recovery requires two consecutive successful checks. An initial baseline sends no health notification; a persistent problem can notify on the next normal check.
+
+Large notification groups are split into bounded messages. Each successfully acknowledged group is removed from the queue separately; unsent events remain available for retry. Disabling a check removes its stored status and queued notification on the next normal check.
+
+The queue retains problem and recovery transitions, so an incident that ends while Gotify is unreachable can still be reported. Pending reminders are merged. The queue remains bounded to 100 events and 1 MiB; when full, the oldest events are discarded. Each event includes its queue timestamp.
+
+New OOM and matching kernel I/O records are journal events, identified by their cursors. New records can notify without a successful check between them; rereading the same records does not generate another event. A later absence of records does not claim that a killed process or failed device recovered. Journal collection processes the oldest pending records first and reduces the page size if output exceeds its byte limit.
+
+If runtime persistence fails, the agent attempts one short emergency notification using the same Gotify and SOCKS5 settings. It reports the write failure and the most important health results, leaves delivery unacknowledged, and exits with an error. Emergency notifications can repeat until persistence works again. Existing lock files can be opened without write access.
+
+Service profiles monitor the configured systemd unit; PostgreSQL also checks cluster status when `pg_lsclusters` is available. They do not perform HTTP or database queries. Detecting a completely unavailable VPS requires an external uptime monitor.
+
 ## Requirements
 
 - Debian 13
@@ -140,7 +152,7 @@ make vet
 make test
 make test-race
 make security
-make build VERSION=0.2.0
+make build
 ```
 
 Install the local build:

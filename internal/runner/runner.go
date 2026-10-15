@@ -93,7 +93,10 @@ func Run(ctx context.Context, timeout time.Duration, path string, args ...string
 		return result, nil
 	}
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return result, fmt.Errorf("command timed out after %s", timeout)
+		return result, fmt.Errorf("command timed out after %s: %w", timeout, ctx.Err())
+	}
+	if err := ctx.Err(); err != nil {
+		return result, err
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {

@@ -200,6 +200,57 @@ func TestSendRejectsInvalidPriority(t *testing.T) {
 	}
 }
 
+func TestSendRejectsOversizedMessageWithoutSending(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	client, err := New(server.URL, "token", time.Second, false, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Send(context.Background(), "title", strings.Repeat("x", 64*1024+1), 5); err == nil {
+		t.Fatal("oversized message was silently truncated and acknowledged")
+	}
+	if requests != 0 {
+		t.Fatalf("oversized message sent %d requests", requests)
+	}
+}
+
+func TestSendRequiresGotifyAcknowledgement(t *testing.T) {
+	for _, response := range []string{"<html>wrong reverse proxy route</html>", "{}", "null", `{"id":0}`, `{"id":-1}`, `{"id":1} trailing`} {
+		t.Run(response, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.WriteString(w, response)
+			}))
+			defer server.Close()
+			client, err := New(server.URL, "token", time.Second, false, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := client.Send(context.Background(), "title", "body", 5); err == nil {
+				t.Fatal("invalid acknowledgement was treated as successful delivery")
+			}
+		})
+	}
+}
+
+func TestSendAcceptsFullSizedGotifyResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 123, "message": strings.Repeat("&", MaxMessageBytes)})
+	}))
+	defer server.Close()
+	client, err := New(server.URL, "token", time.Second, false, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Send(context.Background(), "title", strings.Repeat("&", MaxMessageBytes), 5); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func startSOCKS5(t *testing.T, target string) (string, <-chan string, func()) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")

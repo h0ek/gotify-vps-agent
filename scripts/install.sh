@@ -19,7 +19,7 @@ LOCAL_BINARY=""
 UPGRADE=0
 NO_CONFIG=0
 TEMP_DIR=""
-TIMER_WAS_ENABLED=0
+TIMER_WAS_ACTIVE=0
 INSTALL_COMMITTED=0
 SCRIPT_DIR="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")" && pwd -P)"
 BACKUP_NAMES=(binary service timer timer-override uninstall manifest)
@@ -76,7 +76,7 @@ cleanup() {
       restore_target "${BACKUP_NAMES[${index}]}" "${BACKUP_TARGETS[${index}]}"
     done
     systemctl daemon-reload >/dev/null 2>&1 || true
-    if [[ ${TIMER_WAS_ENABLED} -eq 1 ]]; then
+    if [[ ${TIMER_WAS_ACTIVE} -eq 1 ]]; then
       systemctl start "${PROGRAM}.timer" >/dev/null 2>&1 || true
     fi
   fi
@@ -305,8 +305,8 @@ if [[ -z "${LOCAL_BINARY}" && "${source_version}" != gotify-vps-agent\ ${VERSION
   exit 1
 fi
 
-if systemctl is-enabled --quiet "${PROGRAM}.timer" 2>/dev/null; then
-  TIMER_WAS_ENABLED=1
+if systemctl is-active --quiet "${PROGRAM}.timer" 2>/dev/null; then
+  TIMER_WAS_ACTIVE=1
 fi
 systemctl stop "${PROGRAM}.timer" >/dev/null 2>&1 || true
 systemctl stop "${PROGRAM}.service" >/dev/null 2>&1 || true
@@ -440,7 +440,7 @@ else
   echo "Configuration and state were preserved in ${CONFIG_DIR} and ${STATE_DIR}."
 fi
 systemctl daemon-reload
-systemctl reset-failed >/dev/null 2>&1 || true
+systemctl reset-failed "${PROGRAM}.service" "${PROGRAM}.timer" >/dev/null 2>&1 || true
 echo "Gotify VPS Agent removed."
 UNINSTALL
   atomic_install "${TEMP_DIR}/uninstall.sh" "${UNINSTALL_PATH}" 0750
@@ -462,18 +462,19 @@ if command -v systemd-analyze >/dev/null 2>&1; then
   systemd-analyze verify "${SERVICE_PATH}" "${TIMER_PATH}" >/dev/null
 fi
 
-INSTALL_COMMITTED=1
 installed_version="$("${BINARY_PATH}" version 2>/dev/null || true)"
 echo "Installed ${installed_version:-${PROGRAM}}."
 
 if [[ ${UPGRADE} -eq 1 ]]; then
-  if [[ ${TIMER_WAS_ENABLED} -eq 1 && -f "${CONFIG_DIR}/config.toml" && -f "${CONFIG_DIR}/gotify.token" ]]; then
-    systemctl restart "${PROGRAM}.timer"
+  if [[ ${TIMER_WAS_ACTIVE} -eq 1 ]]; then
+    systemctl start "${PROGRAM}.timer"
   fi
+  INSTALL_COMMITTED=1
   echo "Upgrade complete. Configuration, token, state, journal cursor and notification queue were preserved."
   exit 0
 fi
 
+INSTALL_COMMITTED=1
 if [[ ${NO_CONFIG} -eq 0 ]]; then
   "${BINARY_PATH}" configure
 else

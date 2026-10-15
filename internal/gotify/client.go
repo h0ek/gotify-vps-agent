@@ -19,7 +19,10 @@ import (
 	"github.com/h0ek/gotify-vps-agent/internal/textsafe"
 )
 
-const maxResponseBody = 8192
+const (
+	maxResponseBody = 8192
+	MaxMessageBytes = 64 * 1024
+)
 
 type Client struct {
 	baseURL *url.URL
@@ -171,9 +174,12 @@ func (c *Client) Send(ctx context.Context, title, message string, priority int) 
 	if priority < 0 || priority > 10 {
 		return fmt.Errorf("Gotify priority must be between 0 and 10")
 	}
+	if len(message) > MaxMessageBytes {
+		return fmt.Errorf("Gotify message exceeds %d bytes", MaxMessageBytes)
+	}
 	body := payload{
 		Title:    textsafe.Sanitize(title, 256),
-		Message:  textsafe.Sanitize(message, 64*1024),
+		Message:  textsafe.Sanitize(message, MaxMessageBytes),
 		Priority: priority,
 		Extras: map[string]any{
 			"client::display": map[string]string{"contentType": "text/markdown"},
@@ -198,7 +204,24 @@ func (c *Client) Send(ctx context.Context, title, message string, priority int) 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("Gotify returned HTTP %d: %s", resp.StatusCode, c.redact(readBody(resp.Body)))
 	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBody))
+	const maxAcknowledgement = MaxMessageBytes*6 + maxResponseBody
+	data, err = io.ReadAll(io.LimitReader(resp.Body, maxAcknowledgement+1))
+	if err != nil {
+		return fmt.Errorf("read Gotify acknowledgement: %w", err)
+	}
+	if len(data) > maxAcknowledgement {
+		return fmt.Errorf("Gotify acknowledgement exceeds the safe response limit")
+	}
+	var acknowledgement struct {
+		ID int64 `json:"id"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	if err := decoder.Decode(&acknowledgement); err != nil || acknowledgement.ID <= 0 {
+		return fmt.Errorf("Gotify did not return a valid message acknowledgement")
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return fmt.Errorf("Gotify acknowledgement contains trailing data")
+	}
 	return nil
 }
 

@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GO_VERSION: 1.26.7
+  GO_VERSION: 1.26.9
   GOTOOLCHAIN: local
   GOFLAGS: -mod=readonly
 
@@ -32,6 +32,10 @@ jobs:
           cache: false
       - name: Go format
         run: test -z "$(gofmt -l $(find . -name '*.go' -type f))"
+      - name: Journal integration tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends systemd-journal-remote
       - name: Shell format
         run: go run mvdan.cc/sh/v3/cmd/shfmt@v3.13.1 -d scripts/*.sh
       - name: Shell syntax
@@ -41,13 +45,19 @@ jobs:
       - name: Vet
         run: go vet ./...
       - name: Test
+        env:
+          GVA_REQUIRE_JOURNAL_INTEGRATION: '1'
         run: go test -count=1 ./...
       - name: Race detector
+        env:
+          GVA_REQUIRE_JOURNAL_INTEGRATION: '1'
         run: go test -race -count=1 ./...
       - name: Fuzz config parser
         run: go test ./internal/config -run=^$ -fuzz=FuzzUnmarshal -fuzztime=5s
       - name: Fuzz Gotify URL parser
         run: go test ./internal/gotify -run=^$ -fuzz=FuzzValidateURL -fuzztime=5s
+      - name: Fuzz journal parser
+        run: go test ./internal/checks -run=^$ -fuzz=FuzzParseJournalOutput -fuzztime=5s
       - name: Vulnerability scan
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
       - name: Build amd64

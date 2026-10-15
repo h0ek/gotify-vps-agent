@@ -58,3 +58,13 @@ func TestProxyStatus(t *testing.T) {
 		}
 	}
 }
+
+func TestRejectsTrailingArgumentsBeforeRunningCommands(t *testing.T) {
+	for _, args := range [][]string{{"check", "typo", "--dry-run"}, {"configure", "typo"}, {"reset-state", "--yes", "typo"}, {"test-notification", "--dry-run"}, {"version", "typo"}, {"doctor", "typo"}} {
+		var output, errors bytes.Buffer
+		code := New(strings.NewReader(""), &output, &errors).Run(context.Background(), args)
+		if code == 0 || !strings.Contains(strings.ToLower(errors.String()), "unexpected") {
+			t.Fatalf("arguments %v were not rejected: code=%d stderr=%q", args, code, errors.String())
+		}
+	}
+}

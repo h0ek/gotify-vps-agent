@@ -155,7 +155,11 @@ func unitState(ctx context.Context, command, unit string) string {
 
 func packageInstalled(ctx context.Context, name string) bool {
 	result, err := runner.Run(ctx, 5*time.Second, "/usr/bin/dpkg-query", "-W", "-f=${db:Status-Abbrev}", name)
-	return err == nil && result.ExitCode == 0 && strings.HasPrefix(strings.TrimSpace(result.Output), "ii ")
+	return err == nil && result.ExitCode == 0 && installedStatus(result.Output)
+}
+
+func installedStatus(output string) bool {
+	return strings.TrimSpace(output) == "ii"
 }
 
 func regularExecutable(path string) bool {

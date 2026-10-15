@@ -23,6 +23,7 @@ import (
 	"github.com/h0ek/gotify-vps-agent/internal/runner"
 	"github.com/h0ek/gotify-vps-agent/internal/securefile"
 	"github.com/h0ek/gotify-vps-agent/internal/state"
+	"github.com/h0ek/gotify-vps-agent/internal/systemd"
 )
 
 type CheckOptions struct {
@@ -38,7 +39,10 @@ func acquireLock(path string) (*lock, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return nil, err
 	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	file, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		file, err = os.OpenFile(path, os.O_CREATE|os.O_RDONLY, 0600)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -71,19 +75,34 @@ func RunCheck(ctx context.Context, configPath string, options CheckOptions, outp
 
 	processLock, err := acquireLock(config.LockPath(cfg))
 	if err != nil {
+		if !options.DryRun && storageUnavailable(err) {
+			return reportStorageFailure(ctx, cfg, nil, &persistenceError{Stage: "process lock", Err: err}, output)
+		}
 		return err
 	}
 	defer processLock.Close()
 
 	current, err := state.Load(config.StatePath(cfg))
 	if err != nil {
+		if !options.DryRun && storageUnavailable(err) {
+			return reportStorageFailure(ctx, cfg, nil, &persistenceError{Stage: "reading check state", Err: err}, output)
+		}
 		return err
 	}
 	pending, err := queue.Load(config.QueuePath(cfg))
 	if err != nil {
+		if !options.DryRun && storageUnavailable(err) {
+			return reportStorageFailure(ctx, cfg, nil, &persistenceError{Stage: "reading notification queue", Err: err}, output)
+		}
 		return err
 	}
+	if !options.Baseline {
+		restorePendingState(&current, pending)
+	}
 	runOutput := checks.Run(ctx, cfg, current.LastRun)
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("health check did not complete: %w", err)
+	}
 	results := runOutput.Results
 	if cfg.Checks.DeliveryQueue {
 		oldest := time.Time{}
@@ -100,34 +119,37 @@ func RunCheck(ctx context.Context, configPath string, options CheckOptions, outp
 		return nil
 	}
 	if err := os.MkdirAll(cfg.Agent.StateDir, 0700); err != nil {
-		return err
+		return reportStorageFailure(ctx, cfg, results, &persistenceError{Stage: "state directory", Err: err}, output)
 	}
 	if err := os.Chmod(cfg.Agent.StateDir, 0700); err != nil {
-		return err
+		return reportStorageFailure(ctx, cfg, results, &persistenceError{Stage: "state directory permissions", Err: err}, output)
 	}
 
 	now := time.Now().UTC()
 	if options.Baseline {
 		engine.Baseline(&current, results, now)
 		if err := state.Save(config.StatePath(cfg), current); err != nil {
-			return err
+			return reportStorageFailure(ctx, cfg, results, &persistenceError{Stage: "baseline", Err: err}, output)
 		}
 		if err := writeJournalCursor(cfg, runOutput.JournalCursor); err != nil {
-			return err
+			return reportStorageFailure(ctx, cfg, results, &persistenceError{Stage: "journal cursor", Err: err}, output)
 		}
 		fmt.Fprintln(output, "Initial baseline saved. No health notification was sent.")
 		return nil
 	}
 
 	events := engine.Evaluate(&current, results, cfg, now)
+	pending.RetainChecks(results)
 	pending.Add(events, now)
-	if err := queue.Save(config.QueuePath(cfg), pending); err != nil {
-		return err
-	}
-	if err := state.Save(config.StatePath(cfg), current); err != nil {
-		return err
-	}
-	if err := writeJournalCursor(cfg, runOutput.JournalCursor); err != nil {
+	if err := persistCheck(current, pending, runOutput.JournalCursor, persistence{
+		Queue:  func(value queue.Queue) error { return queue.Save(config.QueuePath(cfg), value) },
+		State:  func(value state.State) error { return state.Save(config.StatePath(cfg), value) },
+		Cursor: func(cursor string) error { return writeJournalCursor(cfg, cursor) },
+	}); err != nil {
+		var failure *persistenceError
+		if errors.As(err, &failure) {
+			return reportStorageFailure(ctx, cfg, results, failure, output)
+		}
 		return err
 	}
 	if len(pending.Events) == 0 {
@@ -148,18 +170,36 @@ func RunCheck(ctx context.Context, configPath string, options CheckOptions, outp
 	if err != nil {
 		return err
 	}
-	message := notify.Build(cfg.Agent.Hostname, pending.Events, now)
-	if err := client.Send(ctx, message.Title, message.Body, message.Priority); err != nil {
-		pending.MarkFailure(now)
-		if saveErr := queue.Save(config.QueuePath(cfg), pending); saveErr != nil {
-			return fmt.Errorf("Gotify delivery failed (%v) and retry state could not be saved: %w", err, saveErr)
-		}
-		fmt.Fprintf(output, "Gotify delivery failed; %d queued events retained, retry after %s: %v\n", len(pending.Events), pending.NextAttemptAt.Format(time.RFC3339), err)
-		return nil
+	err = deliverQueued(ctx, &pending, cfg.Agent.Hostname, now, client.Send, func(value queue.Queue) error {
+		return queue.Save(config.QueuePath(cfg), value)
+	}, output)
+	var failure *persistenceError
+	if errors.As(err, &failure) {
+		return reportStorageFailure(ctx, cfg, results, failure, output)
 	}
-	pending.Clear()
-	if err := queue.Save(config.QueuePath(cfg), pending); err != nil {
-		return err
+	return err
+}
+
+func deliverQueued(ctx context.Context, pending *queue.Queue, hostname string, now time.Time, send func(context.Context, string, string, int) error, save func(queue.Queue) error, output io.Writer) error {
+	for len(pending.Events) > 0 {
+		message, count, err := notify.BuildBatch(hostname, pending.Events, now)
+		if err != nil {
+			return err
+		}
+		if err := send(ctx, message.Title, message.Body, message.Priority); err != nil {
+			pending.MarkFailure(now)
+			if saveErr := save(*pending); saveErr != nil {
+				return &persistenceError{Stage: "delivery retry state", Err: fmt.Errorf("Gotify delivery failed (%v): %w", err, saveErr)}
+			}
+			fmt.Fprintf(output, "Gotify delivery failed; %d queued events retained, retry after %s: %v\n", len(pending.Events), pending.NextAttemptAt.Format(time.RFC3339), err)
+			return nil
+		}
+		remaining := pending.Events[count:]
+		pending.Clear()
+		pending.Events = remaining
+		if err := save(*pending); err != nil {
+			return &persistenceError{Stage: "notification acknowledgement", Err: err}
+		}
 	}
 	fmt.Fprintln(output, "Gotify notification delivered.")
 	return nil
@@ -343,7 +383,7 @@ func Doctor(ctx context.Context, configPath string) ([]DoctorEntry, bool) {
 	} else {
 		add("FAIL", "Journal cursor", err.Error())
 	}
-	timerResult, timerErr := runner.Run(ctx, 10*time.Second, "/usr/bin/systemctl", "show", "gotify-vps-agent.timer", "--property=LoadState,ActiveState,UnitFileState,NextElapseUSecRealtime,NextElapseUSecMonotonic")
+	timerResult, timerErr := runner.Run(ctx, 10*time.Second, "/usr/bin/systemctl", "show", "gotify-vps-agent.timer", "--property=LoadState,ActiveState,SubState,UnitFileState,NextElapseUSecRealtime,NextElapseUSecMonotonic")
 	if timerErr != nil || timerResult.ExitCode != 0 {
 		detail := "unable to inspect timer"
 		if timerErr != nil {
@@ -353,10 +393,8 @@ func Doctor(ctx context.Context, configPath string) ([]DoctorEntry, bool) {
 		}
 		add("FAIL", "Agent timer", detail)
 	} else {
-		properties := parseProperties(timerResult.Output)
-		scheduled := timerValueScheduled(properties["NextElapseUSecRealtime"]) || timerValueScheduled(properties["NextElapseUSecMonotonic"])
-		if properties["LoadState"] == "loaded" && properties["ActiveState"] == "active" && properties["UnitFileState"] == "enabled" && scheduled {
-			add("PASS", "Agent timer", "loaded, active, enabled and scheduled")
+		if !timerResult.Truncated && systemd.TimerHealthy(timerResult.Output) {
+			add("PASS", "Agent timer", "loaded, active, enabled and operational")
 		} else {
 			add("WARN", "Agent timer", strings.ReplaceAll(timerResult.Output, "\n", "; "))
 		}
@@ -402,21 +440,6 @@ func Doctor(ctx context.Context, configPath string) ([]DoctorEntry, bool) {
 		}
 	}
 	return entries, failed
-}
-
-func parseProperties(output string) map[string]string {
-	values := map[string]string{}
-	for _, line := range strings.Split(output, "\n") {
-		key, value, ok := strings.Cut(line, "=")
-		if ok {
-			values[strings.TrimSpace(key)] = strings.TrimSpace(value)
-		}
-	}
-	return values
-}
-
-func timerValueScheduled(value string) bool {
-	return value != "" && value != "0" && value != "n/a"
 }
 
 func checkFile(entries *[]DoctorEntry, failed *bool, path string, expected os.FileMode) {

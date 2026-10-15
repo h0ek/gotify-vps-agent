@@ -56,3 +56,94 @@ func TestBaselineProblemDoesNotCreateFalseRecovery(t *testing.T) {
 		t.Fatal("check did not return to OK")
 	}
 }
+
+func TestBaselinePersistentProblemNotifies(t *testing.T) {
+	cfg := config.Default()
+	now := time.Now().UTC()
+	for _, status := range []model.Status{model.StatusWarning, model.StatusCritical} {
+		t.Run(string(status), func(t *testing.T) {
+			value := state.New()
+			result := model.Result{ID: "nginx", Title: "Nginx", Status: status, Message: "inactive", Immediate: status == model.StatusCritical}
+			Baseline(&value, []model.Result{result}, now)
+			events := Evaluate(&value, []model.Result{result}, cfg, now.Add(5*time.Minute))
+			if len(events) != 1 || events[0].Kind != model.EventProblem {
+				t.Fatalf("persistent baseline failure was suppressed: %#v", events)
+			}
+		})
+	}
+}
+
+func TestMixedFailureSeveritiesStillNotify(t *testing.T) {
+	cfg := config.Default()
+	now := time.Now().UTC()
+	for _, statuses := range [][]model.Status{{model.StatusWarning, model.StatusCritical}, {model.StatusCritical, model.StatusWarning}} {
+		value := state.New()
+		for index, status := range statuses {
+			events := Evaluate(&value, []model.Result{{ID: "memory", Status: status, Message: "low memory"}}, cfg, now.Add(time.Duration(index)*5*time.Minute))
+			if index == 1 && (len(events) != 1 || events[0].Kind != model.EventProblem) {
+				t.Fatalf("continuous failure did not notify for %v: %#v", statuses, events)
+			}
+		}
+		if !value.Checks["memory"].FirstFailureAt.Equal(now) {
+			t.Fatal("severity change reset the incident start")
+		}
+	}
+}
+
+func TestInactiveChecksAreRemoved(t *testing.T) {
+	cfg := config.Default()
+	value := state.New()
+	now := time.Now().UTC()
+	Evaluate(&value, []model.Result{{ID: "service.nginx", Status: model.StatusCritical, Immediate: true}}, cfg, now)
+	if events := Evaluate(&value, nil, cfg, now.Add(5*time.Minute)); len(events) != 0 || len(value.Checks) != 0 {
+		t.Fatalf("disabled check remained active: %#v, %#v", events, value.Checks)
+	}
+}
+
+func TestNotifiedSeverityChangesStillRequireConfirmation(t *testing.T) {
+	cfg := config.Default()
+	now := time.Now().UTC()
+	value := state.New()
+	critical := model.Result{ID: "memory", Status: model.StatusCritical, Message: "low memory"}
+	warning := model.Result{ID: "memory", Status: model.StatusWarning, Message: "low memory"}
+	Evaluate(&value, []model.Result{warning}, cfg, now)
+	Evaluate(&value, []model.Result{warning}, cfg, now.Add(5*time.Minute))
+	if events := Evaluate(&value, []model.Result{critical}, cfg, now.Add(10*time.Minute)); len(events) != 0 {
+		t.Fatalf("one critical sample caused an unconfirmed escalation: %#v", events)
+	}
+	if events := Evaluate(&value, []model.Result{critical}, cfg, now.Add(15*time.Minute)); len(events) != 1 || events[0].Kind != model.EventEscalation {
+		t.Fatalf("persistent critical condition did not escalate: %#v", events)
+	}
+	for index, result := range []model.Result{warning, critical, warning, critical} {
+		if events := Evaluate(&value, []model.Result{result}, cfg, now.Add(time.Duration(index+4)*5*time.Minute)); len(events) != 0 {
+			t.Fatalf("severity flapping caused duplicate alerts: %#v", events)
+		}
+	}
+	if events := Evaluate(&value, []model.Result{critical}, cfg, now.Add(7*time.Hour)); len(events) != 1 || events[0].Kind != model.EventReminder {
+		t.Fatalf("persistent failure did not remind: %#v", events)
+	}
+}
+
+func TestIndependentJournalOccurrencesAndReplay(t *testing.T) {
+	for _, id := range []string{"memory.oom", "kernel.errors"} {
+		value := state.New()
+		cfg := config.Default()
+		now := time.Now().UTC()
+		result := model.Result{ID: id, Status: model.StatusCritical, Message: "identical kernel message", Immediate: true, Occurrence: "first-cursor"}
+		first := Evaluate(&value, []model.Result{result}, cfg, now)
+		result.Occurrence = "second-cursor"
+		second := Evaluate(&value, []model.Result{result}, cfg, now.Add(5*time.Minute))
+		if len(first) != 1 || len(second) != 1 || first[0].Kind != model.EventOccurrence || first[0].Fingerprint == second[0].Fingerprint {
+			t.Fatalf("distinct events merged: first=%#v second=%#v", first, second)
+		}
+		if events := Evaluate(&value, []model.Result{result}, cfg, now.Add(10*time.Minute)); len(events) != 0 {
+			t.Fatalf("same event replayed: %#v", events)
+		}
+		if events := Evaluate(&value, []model.Result{{ID: id, Status: model.StatusOK, Message: "No new matching events"}}, cfg, now.Add(15*time.Minute)); len(events) != 0 {
+			t.Fatalf("occurrence generated false recovery: %#v", events)
+		}
+		if events := Evaluate(&value, []model.Result{result}, cfg, now.Add(20*time.Minute)); len(events) != 0 {
+			t.Fatalf("event replayed after successful read: %#v", events)
+		}
+	}
+}

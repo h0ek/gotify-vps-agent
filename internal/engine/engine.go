@@ -12,9 +12,7 @@ import (
 )
 
 func Baseline(current *state.State, results []model.Result, now time.Time) {
-	if current.Checks == nil {
-		current.Checks = map[string]state.CheckState{}
-	}
+	current.Checks = map[string]state.CheckState{}
 	for _, result := range results {
 		check := state.CheckState{
 			Title:        result.Title,
@@ -39,6 +37,15 @@ func Evaluate(current *state.State, results []model.Result, cfg config.Config, n
 	if current.Checks == nil {
 		current.Checks = map[string]state.CheckState{}
 	}
+	active := make(map[string]bool, len(results))
+	for _, result := range results {
+		active[result.ID] = true
+	}
+	for id := range current.Checks {
+		if !active[id] {
+			delete(current.Checks, id)
+		}
+	}
 	events := make([]model.Event, 0)
 	for _, result := range results {
 		check, exists := current.Checks[result.ID]
@@ -47,7 +54,30 @@ func Evaluate(current *state.State, results []model.Result, cfg config.Config, n
 		}
 		check.Title = result.Title
 		check.Message = result.Message
-		check.Fingerprint = result.Fingerprint()
+		previousFingerprint := check.Fingerprint
+		journalCheck := result.ID == "memory.oom" || result.ID == "kernel.errors"
+		if !journalCheck || result.Occurrence != "" {
+			check.Fingerprint = result.Fingerprint()
+		}
+		if result.Occurrence != "" {
+			if previousFingerprint != check.Fingerprint {
+				events = append(events, newEvent(result, model.EventOccurrence, result.Status, result.Message))
+				check.LastNotificationAt = now
+			}
+			check.Current = result.Status
+			check.LastObserved = result.Status
+			check.ConsecutiveFailures = 1
+			check.ConsecutiveSuccesses = 0
+			check.Notified = true
+			current.Checks[result.ID] = check
+			continue
+		}
+		if journalCheck && check.Current == model.StatusCritical {
+			check.Current = model.StatusOK
+			check.LastObserved = model.StatusOK
+			check.Notified = false
+			check.ConsecutiveFailures = 0
+		}
 
 		if result.Status == model.StatusOK {
 			if check.LastObserved == model.StatusOK {
@@ -71,22 +101,24 @@ func Evaluate(current *state.State, results []model.Result, cfg config.Config, n
 			continue
 		}
 
-		if check.LastObserved == result.Status {
+		if check.LastObserved != model.StatusOK && (!check.Notified || check.LastObserved == result.Status) {
 			check.ConsecutiveFailures++
 		} else {
 			check.ConsecutiveFailures = 1
+		}
+		if check.FirstFailureAt.IsZero() {
 			check.FirstFailureAt = now
 		}
 		check.ConsecutiveSuccesses = 0
 		check.LastObserved = result.Status
 
 		required := cfg.Agent.WarningFailures
-		if result.Status == model.StatusCritical && result.Immediate {
+		if result.Immediate {
 			required = 1
 		}
 
 		switch {
-		case check.Current == model.StatusOK && check.ConsecutiveFailures >= required:
+		case !check.Notified && check.ConsecutiveFailures >= required:
 			events = append(events, newEvent(result, model.EventProblem, result.Status, result.Message))
 			check.Current = result.Status
 			check.LastNotificationAt = now
@@ -122,6 +154,9 @@ func reminderDue(check state.CheckState, cfg config.Config, now time.Time) bool 
 
 func newEvent(result model.Result, kind model.EventKind, status model.Status, message string) model.Event {
 	fingerprintValue := fmt.Sprintf("%s\x00%s\x00%s\x00%s", result.ID, kind, status, message)
+	if result.Occurrence != "" {
+		fingerprintValue += "\x00" + result.Occurrence
+	}
 	sum := sha256.Sum256([]byte(fingerprintValue))
 	return model.Event{
 		CheckID:     result.ID,

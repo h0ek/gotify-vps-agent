@@ -26,3 +26,23 @@ func TestTimerOverrideRejectsUnsafeValues(t *testing.T) {
 		}
 	}
 }
+
+func TestTimerHealthDuringExecutionAndBetweenRuns(t *testing.T) {
+	base := "LoadState=loaded\nActiveState=active\nUnitFileState=enabled\n"
+	cases := []struct {
+		output string
+		want   bool
+	}{
+		{base + "SubState=running\nNextElapseUSecRealtime=n/a\nNextElapseUSecMonotonic=infinity", true},
+		{base + "SubState=waiting\nNextElapseUSecMonotonic=5min", true},
+		{base + "SubState=waiting\nNextElapseUSecRealtime=0\nNextElapseUSecMonotonic=n/a", false},
+		{base + "SubState=elapsed\nNextElapseUSecRealtime=infinity\nNextElapseUSecMonotonic=18446744073709551615", false},
+		{strings.ReplaceAll(base, "enabled", "disabled") + "SubState=running", false},
+		{strings.ReplaceAll(base, "active", "inactive") + "NextElapseUSecMonotonic=5min", false},
+	}
+	for _, test := range cases {
+		if got := TimerHealthy(test.output); got != test.want {
+			t.Fatalf("healthy=%t, want %t for %q", got, test.want, test.output)
+		}
+	}
+}

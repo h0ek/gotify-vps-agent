@@ -6,14 +6,48 @@ import (
 	"strings"
 	"time"
 
+	"github.com/h0ek/gotify-vps-agent/internal/gotify"
 	"github.com/h0ek/gotify-vps-agent/internal/model"
 	"github.com/h0ek/gotify-vps-agent/internal/queue"
+	"github.com/h0ek/gotify-vps-agent/internal/textsafe"
 )
 
 type Message struct {
 	Title    string
 	Body     string
 	Priority int
+}
+
+func StorageFailure(hostname, stage string, err error, results []model.Result, now time.Time) Message {
+	events := []queue.Event{{Event: model.Event{CheckID: "agent.storage", Title: "Agent persistence failure", Status: model.StatusCritical, Kind: model.EventProblem, Priority: 10, Message: "Unable to persist " + stage + ": " + textsafe.Sanitize(err.Error(), 512) + ". This emergency alert was not recorded and may be repeated."}, CreatedAt: now}}
+	for _, status := range []model.Status{model.StatusCritical, model.StatusWarning} {
+		for _, result := range results {
+			if result.Status != status || len(events) >= 8 {
+				continue
+			}
+			events = append(events, queue.Event{Event: model.Event{CheckID: result.ID, Title: textsafe.Sanitize(result.Title, 256), Status: result.Status, Kind: model.EventProblem, Priority: model.Priority(result.Status, model.EventProblem), Message: textsafe.Sanitize(result.Message, 512)}, CreatedAt: now})
+		}
+	}
+	message := Build(hostname, events, now)
+	message.Title = "[" + hostname + "] Agent persistence failure"
+	return message
+}
+
+func BuildBatch(hostname string, events []queue.Event, now time.Time) (Message, int, error) {
+	var message Message
+	count := 0
+	for index := range events {
+		next := Build(hostname, events[:index+1], now)
+		if len(next.Body) > gotify.MaxMessageBytes {
+			if count == 0 {
+				return Message{}, 0, fmt.Errorf("notification for %q exceeds the message limit", events[index].CheckID)
+			}
+			break
+		}
+		message = next
+		count = index + 1
+	}
+	return message, count, nil
 }
 
 func escapeMarkdown(value string) string {
@@ -99,8 +133,14 @@ func Build(hostname string, events []queue.Event, now time.Time) Message {
 				marker = " (reminder)"
 			} else if event.Kind == model.EventEscalation {
 				marker = " (escalated)"
+			} else if event.Kind == model.EventOccurrence {
+				marker = " (new event)"
 			}
-			fmt.Fprintf(&body, "- **%s%s** — %s\n", escapeMarkdown(event.Title), marker, escapeMarkdown(event.Message))
+			observed := ""
+			if !event.CreatedAt.IsZero() {
+				observed = " [" + event.CreatedAt.UTC().Format(time.RFC3339) + "]"
+			}
+			fmt.Fprintf(&body, "- **%s%s**%s — %s\n", escapeMarkdown(event.Title), marker, observed, escapeMarkdown(event.Message))
 		}
 		body.WriteString("\n")
 	}

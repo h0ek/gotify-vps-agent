@@ -51,6 +51,13 @@ func (c *CLI) Run(ctx context.Context, args []string) int {
 		c.usage()
 		return 2
 	}
+	switch remaining[0] {
+	case "status", "doctor", "test-notification", "version", "help", "-h", "--help":
+		if len(remaining) != 1 {
+			fmt.Fprintf(c.Err, "Unexpected arguments for %s\n", remaining[0])
+			return 2
+		}
+	}
 
 	var err error
 	switch remaining[0] {
@@ -100,6 +107,9 @@ func (c *CLI) check(ctx context.Context, configPath string, args []string) error
 	if err := set.Parse(args); err != nil {
 		return err
 	}
+	if len(set.Args()) != 0 {
+		return fmt.Errorf("unexpected check arguments: %s", strings.Join(set.Args(), " "))
+	}
 	if *dryRun && *baseline {
 		return fmt.Errorf("--dry-run and --baseline cannot be used together")
 	}
@@ -114,6 +124,9 @@ func (c *CLI) configure(ctx context.Context, configPath string, args []string) e
 	allowHTTP := set.Bool("allow-insecure-http", false, "allow non-loopback plain HTTP")
 	if err := set.Parse(args); err != nil {
 		return err
+	}
+	if len(set.Args()) != 0 {
+		return fmt.Errorf("unexpected configure arguments: %s", strings.Join(set.Args(), " "))
 	}
 	if err := platform.RequireDebian13(); err != nil {
 		return err
@@ -350,6 +363,9 @@ func (c *CLI) services(ctx context.Context, configPath string, args []string) er
 	}
 	switch command {
 	case "detect":
+		if len(args) != 1 {
+			return fmt.Errorf("usage: services detect")
+		}
 		detected := services.Detect(ctx)
 		detectedByID := map[string]services.Detection{}
 		for _, item := range detected {
@@ -365,6 +381,9 @@ func (c *CLI) services(ctx context.Context, configPath string, args []string) er
 		}
 		return nil
 	case "list":
+		if len(args) > 1 {
+			return fmt.Errorf("usage: services list")
+		}
 		cfg, err := config.Load(configPath)
 		if err != nil {
 			return err
@@ -455,6 +474,9 @@ func (c *CLI) resetState(configPath string, args []string) error {
 	yes := set.Bool("yes", false, "confirm state removal")
 	if err := set.Parse(args); err != nil {
 		return err
+	}
+	if len(set.Args()) != 0 {
+		return fmt.Errorf("unexpected reset-state arguments: %s", strings.Join(set.Args(), " "))
 	}
 	if !*yes {
 		return fmt.Errorf("use --yes to confirm state, journal cursor and queue removal")

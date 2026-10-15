@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/h0ek/gotify-vps-agent/internal/runner"
@@ -12,6 +13,30 @@ import (
 )
 
 const timerOverridePath = "/etc/systemd/system/gotify-vps-agent.timer.d/override.conf"
+
+func TimerHealthy(output string) bool {
+	values := map[string]string{}
+	for _, line := range strings.Split(output, "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if ok {
+			values[strings.TrimSpace(key)] = strings.TrimSpace(value)
+		}
+	}
+	if values["LoadState"] != "loaded" || values["ActiveState"] != "active" || values["UnitFileState"] != "enabled" {
+		return false
+	}
+	if values["SubState"] == "running" {
+		return true
+	}
+	for _, property := range []string{"NextElapseUSecRealtime", "NextElapseUSecMonotonic"} {
+		switch values[property] {
+		case "", "0", "n/a", "infinity", "18446744073709551615":
+		default:
+			return true
+		}
+	}
+	return false
+}
 
 func WriteTimerOverride(ctx context.Context, interval string) error {
 	content, err := timerOverride(interval)

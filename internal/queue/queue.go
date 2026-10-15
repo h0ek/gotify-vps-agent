@@ -67,16 +67,11 @@ func Load(path string) (Queue, error) {
 	if len(value.Events) > maxEvents || value.Attempts < 0 {
 		return Queue{}, fmt.Errorf("queue metadata is invalid")
 	}
-	seen := map[string]bool{}
 	for index := range value.Events {
 		event := &value.Events[index]
 		if event.CheckID == "" || len(event.CheckID) > 128 || event.Fingerprint == "" || len(event.Fingerprint) > 128 {
 			return Queue{}, fmt.Errorf("queue contains an invalid event")
 		}
-		if seen[event.CheckID] {
-			return Queue{}, fmt.Errorf("queue contains duplicate check IDs")
-		}
-		seen[event.CheckID] = true
 		event.Title = textsafe.Sanitize(event.Title, 256)
 		event.Message = textsafe.Sanitize(event.Message, 4096)
 	}
@@ -89,20 +84,31 @@ func (q *Queue) Add(events []model.Event, now time.Time) bool {
 		if incoming.CheckID == "" || incoming.Fingerprint == "" {
 			continue
 		}
-		filtered := q.Events[:0]
-		identical := false
-		for _, existing := range q.Events {
-			if existing.CheckID != incoming.CheckID {
-				filtered = append(filtered, existing)
+		if incoming.Kind == model.EventOccurrence {
+			duplicate := false
+			for _, existing := range q.Events {
+				if existing.CheckID == incoming.CheckID && existing.Fingerprint == incoming.Fingerprint {
+					duplicate = true
+					break
+				}
+			}
+			if duplicate {
 				continue
 			}
-			if existing.Fingerprint == incoming.Fingerprint {
-				filtered = append(filtered, existing)
-				identical = true
+		}
+		last := -1
+		for index := len(q.Events) - 1; index >= 0; index-- {
+			if q.Events[index].CheckID == incoming.CheckID {
+				last = index
+				break
 			}
 		}
-		q.Events = filtered
-		if identical {
+		if last >= 0 && q.Events[last].Fingerprint == incoming.Fingerprint {
+			continue
+		}
+		if last >= 0 && (incoming.Kind == model.EventReminder || incoming.Kind == model.EventEscalation) && q.Events[last].Kind != model.EventRecovery && q.Events[last].Kind != model.EventOccurrence {
+			q.Events[last].Event = incoming
+			changed = true
 			continue
 		}
 		q.Events = append(q.Events, Event{Event: incoming, CreatedAt: now})
@@ -140,13 +146,30 @@ func (q *Queue) Clear() {
 	q.NextAttemptAt = time.Time{}
 }
 
+func (q *Queue) RetainChecks(results []model.Result) {
+	active := make(map[string]bool, len(results))
+	for _, result := range results {
+		active[result.ID] = true
+	}
+	kept := q.Events[:0]
+	for _, event := range q.Events {
+		if active[event.CheckID] {
+			kept = append(kept, event)
+		}
+	}
+	q.Events = kept
+	if len(q.Events) == 0 {
+		q.Clear()
+	}
+}
+
 func (q *Queue) trim() {
 	if len(q.Events) > maxEvents {
 		q.Events = q.Events[len(q.Events)-maxEvents:]
 	}
 	for len(q.Events) > 0 {
-		data, _ := json.Marshal(q)
-		if len(data) <= maxBytes {
+		data, _ := json.MarshalIndent(q, "", "  ")
+		if len(data)+1 <= maxBytes {
 			break
 		}
 		q.Events = q.Events[1:]

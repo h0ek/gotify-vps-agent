@@ -90,6 +90,6 @@ else
 fi
 
 systemctl daemon-reload
-systemctl reset-failed >/dev/null 2>&1 || true
+systemctl reset-failed "${PROGRAM}.service" "${PROGRAM}.timer" >/dev/null 2>&1 || true
 
 echo "Gotify VPS Agent removed."

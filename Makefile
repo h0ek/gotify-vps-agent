@@ -34,6 +34,7 @@ test-race:
 fuzz:
 	go test ./internal/config -run=^$$ -fuzz=FuzzUnmarshal -fuzztime=10s
 	go test ./internal/gotify -run=^$$ -fuzz=FuzzValidateURL -fuzztime=10s
+	go test ./internal/checks -run=^$$ -fuzz=FuzzParseJournalOutput -fuzztime=10s
 
 security:
 	go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...

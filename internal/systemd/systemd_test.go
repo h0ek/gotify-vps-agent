@@ -1,6 +1,7 @@
 package systemd
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -24,6 +25,45 @@ func TestTimerOverrideRejectsUnsafeValues(t *testing.T) {
 		if _, err := timerOverride(value); err == nil {
 			t.Fatalf("expected %q to be rejected", value)
 		}
+	}
+}
+
+func TestTimerOverrideSchedulesFirstAndSubsequentRuns(t *testing.T) {
+	base, err := os.ReadFile("../../packaging/systemd/gotify-vps-agent.timer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, interval := range []string{"1m", "7m", "24h"} {
+		t.Run(interval, func(t *testing.T) {
+			override, err := timerOverride(interval)
+			if err != nil {
+				t.Fatal(err)
+			}
+			triggers := map[string][]string{}
+			for _, line := range strings.Split(string(base)+"\n"+string(override), "\n") {
+				key, value, ok := strings.Cut(line, "=")
+				if !ok {
+					continue
+				}
+				switch key {
+				case "OnActiveSec", "OnBootSec", "OnStartupSec", "OnUnitActiveSec", "OnUnitInactiveSec", "OnCalendar":
+					if value == "" {
+						clear(triggers)
+					} else {
+						triggers[key] = append(triggers[key], value)
+					}
+				}
+			}
+			if len(triggers["OnActiveSec"]) != 1 || triggers["OnActiveSec"][0] != "2m" {
+				t.Fatalf("timer cannot start its first check after activation: %v", triggers)
+			}
+			if len(triggers["OnUnitInactiveSec"]) != 1 || triggers["OnUnitInactiveSec"][0] != interval {
+				t.Fatalf("timer cannot repeat checks after completion: %v", triggers)
+			}
+			if len(triggers) != 2 {
+				t.Fatalf("unexpected additional timer triggers: %v", triggers)
+			}
+		})
 	}
 }
 

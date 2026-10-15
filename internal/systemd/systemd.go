@@ -64,7 +64,7 @@ func timerOverride(interval string) ([]byte, error) {
 	if err != nil || duration < time.Minute || duration > 24*time.Hour {
 		return nil, fmt.Errorf("invalid timer interval %q", interval)
 	}
-	return []byte(fmt.Sprintf("[Timer]\nOnBootSec=\nOnUnitActiveSec=\nOnUnitInactiveSec=\nOnUnitInactiveSec=%s\n", interval)), nil
+	return []byte(fmt.Sprintf("[Timer]\nOnBootSec=\nOnUnitActiveSec=\nOnUnitInactiveSec=\nOnActiveSec=2m\nOnUnitInactiveSec=%s\n", interval)), nil
 }
 
 func EnableTimer(ctx context.Context) error {

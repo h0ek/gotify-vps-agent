@@ -1,227 +1,131 @@
 # Gotify VPS Agent
 
-Gotify VPS Agent monitors essential Debian 13 VPS health conditions and sends deduplicated alerts and recovery notifications to Gotify.
+Monitor a Debian 13 VPS and receive health alerts in Gotify. The agent runs through a systemd timer, checks the host approximately every five minutes by default, and groups detected problems into notifications.
 
-Unofficial community project. Not affiliated with or endorsed by the Gotify project.
+Unofficial community project. Not affiliated with or endorsed by Gotify.
 
 ## Features
 
-- failed systemd units
-- disk usage, inode usage and read-only filesystems
-- available memory, swap usage, OOM events and CPU load
-- kernel and block-device errors
-- APT, DPKG and unattended-upgrades status
-- reboot requirement and running kernel checks
-- time synchronization
-- agent timer and execution freshness
-- bounded notification queue with deduplication and backoff
-- service checks for SSH, Nginx, PHP-FPM, MariaDB/MySQL, PostgreSQL and Tor
-- aggregated warnings and critical alerts, with optional reminders and recovery notifications
-- optional local SOCKS5 or SOCKS5H delivery, including Gotify v3 onion services
+- Failed systemd units and supported services: SSH, Nginx, PHP-FPM, MariaDB/MySQL, PostgreSQL and Tor.
+- Disk space, inodes and read-only filesystems.
+- Available memory, swap, CPU load and new OOM events.
+- Kernel and block-device errors.
+- APT, DPKG, unattended-upgrades, reboot requirements and running kernel checks.
+- Time synchronization, agent scheduling and notification delivery health.
+- Deduplicated alerts, optional recovery notifications and configurable reminders.
+- Direct Gotify delivery or a local SOCKS5/SOCKS5H proxy, including Tor onion services.
 
-The agent does not open network ports, accept inbound connections, load plugins or perform automatic remediation. It only sends outbound requests to the configured Gotify server, directly or through an explicitly configured loopback SOCKS5 proxy.
+The agent monitors and reports. Package updates, service restarts and scheduled reboots remain the responsibility of your system configuration. Service checks inspect systemd status; use an external uptime monitor to detect a completely unavailable VPS.
 
-By default, warnings and non-immediate critical conditions require two consecutive failing checks. Selected critical conditions, such as an inactive monitored service, and missed execution intervals notify immediately. Recovery requires two consecutive successful checks. An initial baseline sends no health notification; a persistent problem can notify on the next normal check.
+## Install
 
-Periodic reminders are disabled by default. A check sends one problem notification, at most one escalation from WARNING to CRITICAL, and one recovery notification when it returns to OK. The incident keeps its highest notified severity until confirmed recovery, so changes between WARNING and CRITICAL do not repeatedly escalate the same incident. A later failure after recovery is a new incident.
+Requirements: Debian 13 with systemd, an AMD64 or ARM64 CPU, root access and a Gotify **application token**.
 
-Notification settings belong in the existing `[agent]` section of `/etc/gotify-vps-agent/config.toml`:
-
-```toml
-warning_reminder_hours = 0
-critical_reminder_hours = 0
-notify_recovery = true
-```
-
-Set `notify_recovery = false` for problem and escalation notifications only. State still returns to OK after confirmed recovery, allowing later incidents to notify normally. A positive reminder interval enables reminders for that severity. Upgrades preserve explicit settings in existing configuration files. Events already queued remain available for delivery.
-
-Deleting messages in Gotify does not reset the agent's incident state. Keep the state directory when upgrading to preserve deduplication. Routine successful checks, package upgrades and system startup do not generate informational notifications.
-
-Large notification groups are split into bounded messages. Each successfully acknowledged group is removed from the queue separately; unsent events remain available for retry. Disabling a check removes its stored status and queued notification on the next normal check.
-
-The queue retains problem and recovery transitions, so an incident that ends while Gotify is unreachable can still be reported. Pending reminders are merged. The queue remains bounded to 100 events and 1 MiB; when full, the oldest events are discarded. Each event includes its queue timestamp.
-
-New OOM and matching kernel I/O records are journal events, identified by their cursors. New records can notify without a successful check between them; rereading the same records does not generate another event. A later absence of records does not claim that a killed process or failed device recovered. Journal collection processes the oldest pending records first and reduces the page size if output exceeds its byte limit.
-
-If runtime persistence fails, the agent attempts one short emergency notification using the same Gotify and SOCKS5 settings. It reports the write failure and the most important health results, leaves delivery unacknowledged, and exits with an error. Emergency notifications can repeat until persistence works again. Existing lock files can be opened without write access.
-
-Service profiles monitor the configured systemd unit; PostgreSQL also checks cluster status when `pg_lsclusters` is available. They do not perform HTTP or database queries. Detecting a completely unavailable VPS requires an external uptime monitor.
-
-## Requirements
-
-- Debian 13
-- systemd
-- root privileges
-- Gotify application token
-
-Recommended packages:
+Install the recommended packages:
 
 ```bash
 sudo apt update
 sudo apt install curl needrestart unattended-upgrades
 ```
 
-A local SOCKS5 proxy is optional. A standard local Tor daemon commonly exposes SOCKS on:
-
-```text
-socks5h://127.0.0.1:9050
-```
-
-## Install
-
-Download and review the installer:
+Download and review the installer, then run it:
 
 ```bash
-curl -fLO https://github.com/h0ek/gotify-vps-agent/releases/latest/download/install.sh
+curl -fL -o install.sh https://github.com/h0ek/gotify-vps-agent/releases/latest/download/install.sh
 less install.sh
 sudo bash install.sh
 ```
 
-The installer downloads the correct binary, verifies its SHA-256 checksum, configures Gotify, detects supported services, creates an initial baseline and installs the systemd service and timer.
+Setup verifies the downloaded binary's checksum, asks for your Gotify URL and token, detects supported services, and offers to enable monitoring. It sends a test notification and offers to save an initial baseline without health alerts.
 
-During a new installation, SOCKS5 delivery is disabled by default. When enabled, the suggested proxy is `socks5h://127.0.0.1:9050`.
+Check the installation:
+
+```bash
+sudo gotify-vps-agent doctor
+sudo gotify-vps-agent status
+```
 
 ## Commands
 
-```text
-gotify-vps-agent configure
-gotify-vps-agent check
-gotify-vps-agent check --dry-run
-gotify-vps-agent status
-gotify-vps-agent doctor
-gotify-vps-agent test-notification
-gotify-vps-agent services
-gotify-vps-agent services detect
-gotify-vps-agent services enable nginx
-gotify-vps-agent services disable nginx
-gotify-vps-agent proxy status
-gotify-vps-agent proxy enable
-gotify-vps-agent proxy disable
-gotify-vps-agent timer sync
-gotify-vps-agent reset-state --yes
-gotify-vps-agent version
-```
+| Command | Purpose |
+| --- | --- |
+| `sudo gotify-vps-agent configure` | Open interactive configuration. |
+| `sudo gotify-vps-agent status` | Show saved check results and pending notifications. |
+| `sudo gotify-vps-agent doctor` | Diagnose configuration, dependencies and connectivity. |
+| `sudo gotify-vps-agent check` | Run checks now and send notifications when needed. |
+| `sudo gotify-vps-agent check --dry-run` | Show results without sending notifications or changing state. |
+| `sudo gotify-vps-agent test-notification` | Send one test message to Gotify. |
+| `sudo gotify-vps-agent services` | List enabled service checks. |
+| `sudo gotify-vps-agent services detect` | Show supported services detected on this host. |
+| `sudo gotify-vps-agent services enable nginx` | Enable a service check; replace `nginx` with a detected service ID. |
+| `sudo gotify-vps-agent services disable nginx` | Disable a service check. |
+| `sudo gotify-vps-agent proxy status` | Show the Gotify URL and proxy mode. |
+| `sudo gotify-vps-agent proxy enable` | Configure and test delivery through a local SOCKS5 proxy. |
+| `sudo gotify-vps-agent proxy disable` | Configure and test direct delivery. |
+| `sudo gotify-vps-agent timer sync` | Apply the configured check interval to systemd. |
+| `gotify-vps-agent version` | Show the installed version. |
+| `gotify-vps-agent help` | Show command syntax and additional options. |
 
-Commands that read or modify protected state require root privileges.
-
-## SOCKS5 and onion services
-
-Enable SOCKS5 interactively on an existing installation:
+View recent agent logs with:
 
 ```bash
-sudo gotify-vps-agent proxy enable
+sudo journalctl -u gotify-vps-agent.service -n 50 --no-pager
 ```
 
-The command asks for the Gotify server URL and the SOCKS5 proxy URL. It sends one test notification before saving. If the test fails, the existing configuration remains unchanged.
+## Configuration and notifications
 
-Enable it non-interactively:
+| Location | Contents |
+| --- | --- |
+| `/etc/gotify-vps-agent/config.toml` | Gotify URL, thresholds, enabled checks and notification settings. |
+| `/etc/gotify-vps-agent/gotify.token` | Application token; keep this file private. |
+| `/var/lib/gotify-vps-agent/` | Incident state and pending notifications; keep it when upgrading. |
 
-```bash
-sudo gotify-vps-agent proxy enable \
-  --server http://exampleexampleexampleexampleexampleexampleexample.onion \
-  --proxy socks5h://127.0.0.1:9050
+By default, an incident sends one problem alert, at most one escalation from WARNING to CRITICAL, and one recovery notification. Periodic reminders are disabled. Recovery requires two successful checks; a later failure is a new incident. New OOM and kernel I/O events can notify separately.
+
+For problem and escalation alerts only, set these values in the **existing** `[agent]` section of `config.toml`:
+
+```toml
+warning_reminder_hours = 0
+critical_reminder_hours = 0
+notify_recovery = false
 ```
 
-Check the current mode:
+A positive reminder interval enables reminders for that severity. Upgrades preserve existing settings. Changes are read on the next check; after editing `interval` manually, also run `sudo gotify-vps-agent timer sync`.
 
-```bash
-sudo gotify-vps-agent proxy status
-```
+Deleting a message in Gotify does not reset the agent's incident state. Successful routine checks, package upgrades and system startup do not send informational messages.
 
-Disable the proxy and optionally switch back to a direct Gotify URL:
+If Gotify is unavailable, queued messages are retried. The queue holds up to 100 events and 1 MiB, discarding the oldest events when full. Emergency alerts about state storage failures may repeat until storage works again.
 
-```bash
-sudo gotify-vps-agent proxy disable \
-  --server https://gotify.example.com
-```
+## SOCKS5 and Tor
 
-Only loopback SOCKS5 proxies are accepted. Proxy authentication, remote proxy hosts, paths, query strings and unsupported schemes are rejected. A `.onion` Gotify URL requires SOCKS5 and never falls back to a direct connection.
+Run `sudo gotify-vps-agent proxy enable` and enter your Gotify URL and local proxy, usually `socks5h://127.0.0.1:9050` for Tor. Onion URLs require proxy delivery. Only loopback proxies are supported.
 
-Plain HTTP remains blocked for non-loopback clearnet targets unless `configure --allow-insecure-http` is used. Plain HTTP is accepted for a valid v3 onion service only when SOCKS5 is enabled.
+Proxy changes send a test message before saving; a failed test preserves the previous configuration. Proxy delivery never falls back to a direct connection. Use an HTTPS URL when switching back to direct delivery.
 
 ## Upgrade
 
-Download the current installer and run:
+Download a fresh installer and upgrade the existing installation:
 
 ```bash
-sudo bash install.sh --upgrade
-```
-
-The upgrade preserves the configuration, application token, state, journal cursor, notification queue and timer state.
-
-After upgrading an existing installation to a release with SOCKS5 support:
-
-```bash
-sudo gotify-vps-agent proxy enable
-sudo gotify-vps-agent proxy status
+curl -fL -o install.sh https://github.com/h0ek/gotify-vps-agent/releases/latest/download/install.sh &&
+sudo bash install.sh --upgrade &&
 sudo gotify-vps-agent doctor
 ```
 
-## Build from source
-
-```bash
-make fmt-check
-make shellcheck
-make vet
-make test
-make test-race
-make security
-make build
-```
-
-Install the local build:
-
-```bash
-sudo ./scripts/install.sh --local ./dist/gotify-vps-agent
-```
-
-## Files
-
-```text
-/usr/local/bin/gotify-vps-agent
-/usr/local/lib/gotify-vps-agent/uninstall.sh
-/etc/gotify-vps-agent/config.toml
-/etc/gotify-vps-agent/gotify.token
-/var/lib/gotify-vps-agent/state.json
-/var/lib/gotify-vps-agent/queue.json
-/var/lib/gotify-vps-agent/journal.cursor
-```
-
-The application token is stored separately with mode `0600`. It is not placed in command arguments, configuration output or journal messages.
-
-The optional proxy setting is stored in `/etc/gotify-vps-agent/config.toml`:
-
-```toml
-[gotify]
-url = "http://exampleexampleexampleexampleexampleexampleexample.onion"
-token_file = "/etc/gotify-vps-agent/gotify.token"
-timeout = "10s"
-allow_insecure_http = false
-proxy_url = "socks5h://127.0.0.1:9050"
-```
+Configuration, token, incident state and pending notifications are preserved. The installer restarts the timer if it was running before the upgrade.
 
 ## Uninstall
 
-Keep configuration and state:
+Remove the agent and its systemd units while keeping configuration and state:
 
 ```bash
 sudo /usr/local/lib/gotify-vps-agent/uninstall.sh
 ```
 
-Remove the application, configuration, token and state:
+To also delete configuration, the token, state and timer overrides:
 
 ```bash
 sudo /usr/local/lib/gotify-vps-agent/uninstall.sh --purge
 ```
 
-## Security
-
-The agent uses fixed command paths and argument structures, command timeouts, bounded output, strict input parsing, atomically written root-owned files, TLS certificate verification and a hardened systemd service.
-
-SOCKS5 delivery is fail closed. If the local proxy or onion service is unavailable, notifications remain in the bounded queue and are retried later. The agent does not retry the same destination directly.
-
-See [SECURITY.md](SECURITY.md) for vulnerability reporting.
-
-## License
-
-MIT
+Licensed under [MIT](LICENSE). See [SECURITY.md](SECURITY.md) for vulnerability reporting.

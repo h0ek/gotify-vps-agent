@@ -123,6 +123,53 @@ func TestUnmarshalLegacyConfigWithoutProxy(t *testing.T) {
 	}
 }
 
+func TestNotificationPolicy(t *testing.T) {
+	cfg := Default()
+	if cfg.Agent.WarningReminderHours != 0 || cfg.Agent.CriticalReminderHours != 0 || !cfg.Agent.NotifyRecovery {
+		t.Fatalf("unexpected default notification policy: %#v", cfg.Agent)
+	}
+	data := []byte("version = 1\n[agent]\nwarning_reminder_hours = 24\ncritical_reminder_hours = 6\n[gotify]\nurl = \"https://gotify.example\"\n")
+	if err := Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Agent.WarningReminderHours != 24 || cfg.Agent.CriticalReminderHours != 6 || !cfg.Agent.NotifyRecovery {
+		t.Fatalf("legacy notification policy was changed: %#v", cfg.Agent)
+	}
+	cfg.Agent.WarningReminderHours = 0
+	cfg.Agent.CriticalReminderHours = 0
+	cfg.Agent.NotifyRecovery = false
+	encoded, err := Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded := Default()
+	if err := Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(cfg, decoded) {
+		t.Fatalf("quiet policy was lost during round trip: %#v", decoded.Agent)
+	}
+}
+
+func TestReminderIntervalBounds(t *testing.T) {
+	for _, key := range []string{"warning_reminder_hours", "critical_reminder_hours"} {
+		for _, interval := range []string{"-1", "0", "1", "8760", "8761"} {
+			cfg := Default()
+			cfg.Gotify.URL = "https://gotify.example"
+			if err := Unmarshal([]byte("[agent]\n"+key+" = "+interval+"\n"), &cfg); err != nil {
+				t.Fatal(err)
+			}
+			valid := interval != "-1" && interval != "8761"
+			if err := cfg.Validate(); (err == nil) != valid {
+				t.Fatalf("%s=%s: expected valid=%t, got %v", key, interval, valid, err)
+			}
+		}
+	}
+}
+
 func FuzzUnmarshal(f *testing.F) {
 	f.Add([]byte("version = 1\n[gotify]\nurl = \"https://gotify.example\"\n"))
 	f.Add([]byte("[services]\nnginx = \"nginx.service\"\n"))

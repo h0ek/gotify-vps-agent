@@ -37,6 +37,7 @@ type Agent struct {
 	StateDir              string
 	WarningFailures       int
 	RecoverySuccesses     int
+	NotifyRecovery        bool
 	WarningReminderHours  int
 	CriticalReminderHours int
 }
@@ -95,8 +96,9 @@ func Default() Config {
 			StateDir:              DefaultStateDir,
 			WarningFailures:       2,
 			RecoverySuccesses:     2,
-			WarningReminderHours:  24,
-			CriticalReminderHours: 6,
+			NotifyRecovery:        true,
+			WarningReminderHours:  0,
+			CriticalReminderHours: 0,
 		},
 		Gotify: Gotify{
 			TokenFile: DefaultTokenPath,
@@ -286,6 +288,10 @@ func assign(cfg *Config, section, key, raw string) error {
 			value, err := intValue()
 			cfg.Agent.RecoverySuccesses = value
 			return err
+		case "notify_recovery":
+			value, err := boolValue()
+			cfg.Agent.NotifyRecovery = value
+			return err
 		case "warning_reminder_hours":
 			value, err := intValue()
 			cfg.Agent.WarningReminderHours = value
@@ -448,8 +454,8 @@ func (cfg Config) Validate() error {
 	if cfg.Agent.WarningFailures < 1 || cfg.Agent.WarningFailures > 100 || cfg.Agent.RecoverySuccesses < 1 || cfg.Agent.RecoverySuccesses > 100 {
 		return fmt.Errorf("failure and recovery counters must be between 1 and 100")
 	}
-	if cfg.Agent.WarningReminderHours < 1 || cfg.Agent.WarningReminderHours > 8760 || cfg.Agent.CriticalReminderHours < 1 || cfg.Agent.CriticalReminderHours > 8760 {
-		return fmt.Errorf("reminder intervals must be between 1 and 8760 hours")
+	if cfg.Agent.WarningReminderHours < 0 || cfg.Agent.WarningReminderHours > 8760 || cfg.Agent.CriticalReminderHours < 0 || cfg.Agent.CriticalReminderHours > 8760 {
+		return fmt.Errorf("reminder intervals must be between 0 and 8760 hours (0 disables reminders)")
 	}
 	timeout, err := time.ParseDuration(cfg.Gotify.Timeout)
 	if err != nil || timeout < time.Second || timeout > time.Minute {
@@ -518,6 +524,7 @@ func Marshal(cfg Config) ([]byte, error) {
 	writeString("state_dir", cfg.Agent.StateDir)
 	writeInt("warning_failures", cfg.Agent.WarningFailures)
 	writeInt("recovery_successes", cfg.Agent.RecoverySuccesses)
+	writeBool("notify_recovery", cfg.Agent.NotifyRecovery)
 	writeInt("warning_reminder_hours", cfg.Agent.WarningReminderHours)
 	writeInt("critical_reminder_hours", cfg.Agent.CriticalReminderHours)
 

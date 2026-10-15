@@ -61,6 +61,9 @@ func restorePendingState(current *state.State, pending queue.Queue) {
 		if event.Kind != model.EventProblem && event.Kind != model.EventEscalation && event.Kind != model.EventReminder {
 			continue
 		}
+		if !check.LastRecoveryAt.IsZero() && !check.LastRecoveryAt.Before(event.CreatedAt) {
+			continue
+		}
 		if check.Notified || (event.Status != model.StatusWarning && event.Status != model.StatusCritical) {
 			continue
 		}

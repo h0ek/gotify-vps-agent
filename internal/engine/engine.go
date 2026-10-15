@@ -88,9 +88,11 @@ func Evaluate(current *state.State, results []model.Result, cfg config.Config, n
 			check.ConsecutiveFailures = 0
 			check.FirstFailureAt = time.Time{}
 			if check.Current != model.StatusOK && check.Notified && check.ConsecutiveSuccesses >= cfg.Agent.RecoverySuccesses {
-				events = append(events, newEvent(result, model.EventRecovery, model.StatusOK, fmt.Sprintf("Recovered: %s", result.Message)))
+				if cfg.Agent.NotifyRecovery {
+					events = append(events, newEvent(result, model.EventRecovery, model.StatusOK, fmt.Sprintf("Recovered: %s", result.Message)))
+					check.LastNotificationAt = now
+				}
 				check.Current = model.StatusOK
-				check.LastNotificationAt = now
 				check.LastRecoveryAt = now
 				check.Notified = false
 			} else if check.Current != model.StatusOK && !check.Notified && check.ConsecutiveSuccesses >= cfg.Agent.RecoverySuccesses {
@@ -119,7 +121,9 @@ func Evaluate(current *state.State, results []model.Result, cfg config.Config, n
 
 		switch {
 		case !check.Notified && check.ConsecutiveFailures >= required:
-			events = append(events, newEvent(result, model.EventProblem, result.Status, result.Message))
+			event := newEvent(result, model.EventProblem, result.Status, result.Message)
+			event.Fingerprint += fmt.Sprintf("-%d", check.FirstFailureAt.UnixNano())
+			events = append(events, event)
 			check.Current = result.Status
 			check.LastNotificationAt = now
 			check.Notified = true
@@ -128,8 +132,6 @@ func Evaluate(current *state.State, results []model.Result, cfg config.Config, n
 			check.Current = model.StatusCritical
 			check.LastNotificationAt = now
 			check.Notified = true
-		case check.Current == model.StatusCritical && result.Status == model.StatusWarning && check.ConsecutiveFailures >= cfg.Agent.WarningFailures:
-			check.Current = model.StatusWarning
 		case check.Current == result.Status && check.Notified && reminderDue(check, cfg, now):
 			events = append(events, newEvent(result, model.EventReminder, result.Status, result.Message))
 			check.LastNotificationAt = now
@@ -148,6 +150,9 @@ func reminderDue(check state.CheckState, cfg config.Config, now time.Time) bool 
 	hours := cfg.Agent.WarningReminderHours
 	if check.Current == model.StatusCritical {
 		hours = cfg.Agent.CriticalReminderHours
+	}
+	if hours == 0 {
+		return false
 	}
 	return now.Sub(check.LastNotificationAt) >= time.Duration(hours)*time.Hour
 }

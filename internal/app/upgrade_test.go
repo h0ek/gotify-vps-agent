@@ -1,8 +1,12 @@
 package app
 
 import (
+	"context"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -78,4 +82,82 @@ func TestUpgradeReadsLegacyRuntimeAndKeepsOfflineIncidentHistory(t *testing.T) {
 			t.Fatalf("upgrade rewrote %s", path)
 		}
 	}
+}
+
+func TestSilentRecoveryKeepsDistinctOfflineIncidents(t *testing.T) {
+	cfg := config.Default()
+	cfg.Agent.NotifyRecovery = false
+	current := state.New()
+	pending := queue.New()
+	dir := t.TempDir()
+	statePath, queuePath := filepath.Join(dir, "state.json"), filepath.Join(dir, "queue.json")
+	now := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	save := func(value queue.Queue) error { return queue.Save(queuePath, value) }
+	cycle := func(status model.Status, want model.EventKind) {
+		t.Helper()
+		restorePendingState(&current, pending)
+		result := model.Result{ID: "service.nginx", Title: "Nginx service", Status: status, Message: "same service measurement"}
+		events := engine.Evaluate(&current, []model.Result{result}, cfg, now)
+		if want == "" {
+			if len(events) != 0 {
+				t.Fatalf("unexpected notification for %s: %#v", status, events)
+			}
+		} else if len(events) != 1 || events[0].Kind != want {
+			t.Fatalf("expected %s, got %#v", want, events)
+		}
+		pending.Add(events, now)
+		if err := state.Save(statePath, current); err != nil {
+			t.Fatal(err)
+		}
+		if err := save(pending); err != nil {
+			t.Fatal(err)
+		}
+		var err error
+		current, err = state.Load(statePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pending, err = queue.Load(queuePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		now = now.Add(5 * time.Minute)
+	}
+	cycle(model.StatusWarning, "")
+	cycle(model.StatusWarning, model.EventProblem)
+	if err := deliverQueued(context.Background(), &pending, "host", now, func(context.Context, string, string, int) error {
+		return errors.New("Gotify is unavailable")
+	}, save, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	cycle(model.StatusOK, "")
+	cycle(model.StatusOK, "")
+	cycle(model.StatusOK, "")
+	if current.Checks["service.nginx"].Current != model.StatusOK || current.Checks["service.nginx"].Notified {
+		t.Fatal("an old queued problem reopened the recovered incident")
+	}
+	cycle(model.StatusWarning, "")
+	cycle(model.StatusWarning, model.EventProblem)
+	if len(pending.Events) != 2 || pending.Events[0].Fingerprint == pending.Events[1].Fingerprint {
+		t.Fatalf("distinct offline incidents were merged: %#v", pending.Events)
+	}
+	cycle(model.StatusOK, "")
+	cycle(model.StatusOK, "")
+	cycle(model.StatusOK, "")
+	if current.Checks["service.nginx"].Current != model.StatusOK {
+		t.Fatal("the second silent recovery did not survive a restart")
+	}
+	if err := deliverQueued(context.Background(), &pending, "host", now, func(_ context.Context, _ string, body string, _ int) error {
+		if strings.Contains(body, "RECOVERY") || strings.Count(body, "**Nginx service**") != 2 {
+			t.Fatalf("wrong incident history: %s", body)
+		}
+		return nil
+	}, save, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if len(pending.Events) != 0 {
+		t.Fatal("delivered incidents remained queued")
+	}
+	cycle(model.StatusWarning, "")
+	cycle(model.StatusWarning, model.EventProblem)
 }

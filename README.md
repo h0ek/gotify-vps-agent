@@ -16,12 +16,26 @@ Unofficial community project. Not affiliated with or endorsed by the Gotify proj
 - agent timer and execution freshness
 - bounded notification queue with deduplication and backoff
 - service checks for SSH, Nginx, PHP-FPM, MariaDB/MySQL, PostgreSQL and Tor
-- aggregated warnings, critical alerts, reminders and recovery notifications
+- aggregated warnings and critical alerts, with optional reminders and recovery notifications
 - optional local SOCKS5 or SOCKS5H delivery, including Gotify v3 onion services
 
 The agent does not open network ports, accept inbound connections, load plugins or perform automatic remediation. It only sends outbound requests to the configured Gotify server, directly or through an explicitly configured loopback SOCKS5 proxy.
 
 By default, warnings and non-immediate critical conditions require two consecutive failing checks. Selected critical conditions, such as an inactive monitored service, and missed execution intervals notify immediately. Recovery requires two consecutive successful checks. An initial baseline sends no health notification; a persistent problem can notify on the next normal check.
+
+Periodic reminders are disabled by default. A check sends one problem notification, at most one escalation from WARNING to CRITICAL, and one recovery notification when it returns to OK. The incident keeps its highest notified severity until confirmed recovery, so changes between WARNING and CRITICAL do not repeatedly escalate the same incident. A later failure after recovery is a new incident.
+
+Notification settings belong in the existing `[agent]` section of `/etc/gotify-vps-agent/config.toml`:
+
+```toml
+warning_reminder_hours = 0
+critical_reminder_hours = 0
+notify_recovery = true
+```
+
+Set `notify_recovery = false` for problem and escalation notifications only. State still returns to OK after confirmed recovery, allowing later incidents to notify normally. A positive reminder interval enables reminders for that severity. Upgrades preserve explicit settings in existing configuration files. Events already queued remain available for delivery.
+
+Deleting messages in Gotify does not reset the agent's incident state. Keep the state directory when upgrading to preserve deduplication. Routine successful checks, package upgrades and system startup do not generate informational notifications.
 
 Large notification groups are split into bounded messages. Each successfully acknowledged group is removed from the queue separately; unsent events remain available for retry. Disabling a check removes its stored status and queued notification on the next normal check.
 

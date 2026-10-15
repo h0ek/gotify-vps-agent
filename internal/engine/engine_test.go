@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -102,6 +104,7 @@ func TestInactiveChecksAreRemoved(t *testing.T) {
 
 func TestNotifiedSeverityChangesStillRequireConfirmation(t *testing.T) {
 	cfg := config.Default()
+	cfg.Agent.CriticalReminderHours = 6
 	now := time.Now().UTC()
 	value := state.New()
 	critical := model.Result{ID: "memory", Status: model.StatusCritical, Message: "low memory"}
@@ -121,6 +124,105 @@ func TestNotifiedSeverityChangesStillRequireConfirmation(t *testing.T) {
 	}
 	if events := Evaluate(&value, []model.Result{critical}, cfg, now.Add(7*time.Hour)); len(events) != 1 || events[0].Kind != model.EventReminder {
 		t.Fatalf("persistent failure did not remind: %#v", events)
+	}
+}
+
+func TestQuietIncidentAcrossRestartsAndSeverityChanges(t *testing.T) {
+	for _, notifyRecovery := range []bool{true, false} {
+		t.Run(fmt.Sprintf("recovery=%t", notifyRecovery), func(t *testing.T) {
+			cfg := config.Default()
+			cfg.Agent.NotifyRecovery = notifyRecovery
+			value := state.New()
+			path := filepath.Join(t.TempDir(), "state.json")
+			now := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+			recovery := model.EventKind("")
+			if notifyRecovery {
+				recovery = model.EventRecovery
+			}
+			steps := []struct {
+				status model.Status
+				kind   model.EventKind
+			}{
+				{model.StatusWarning, ""},
+				{model.StatusWarning, model.EventProblem},
+				{model.StatusCritical, ""},
+				{model.StatusCritical, model.EventEscalation},
+				{model.StatusWarning, ""},
+				{model.StatusWarning, ""},
+				{model.StatusCritical, ""},
+				{model.StatusCritical, ""},
+				{model.StatusOK, ""},
+				{model.StatusWarning, ""},
+				{model.StatusWarning, ""},
+				{model.StatusCritical, ""},
+				{model.StatusCritical, ""},
+				{model.StatusOK, ""},
+				{model.StatusOK, recovery},
+				{model.StatusOK, ""},
+				{model.StatusWarning, ""},
+				{model.StatusWarning, model.EventProblem},
+				{model.StatusWarning, ""},
+				{model.StatusWarning, ""},
+			}
+			for index, step := range steps {
+				result := model.Result{ID: "memory", Status: step.status, Message: fmt.Sprintf("measurement %d", index)}
+				events := Evaluate(&value, []model.Result{result}, cfg, now.Add(time.Duration(index)*48*time.Hour))
+				if step.kind == "" {
+					if len(events) != 0 {
+						t.Fatalf("step %d repeated a notification: %#v", index, events)
+					}
+				} else if len(events) != 1 || events[0].Kind != step.kind {
+					t.Fatalf("step %d: expected %s, got %#v", index, step.kind, events)
+				}
+				if index >= 3 && index < 14 && value.Checks["memory"].Current != model.StatusCritical {
+					t.Fatalf("step %d forgot the incident's highest severity", index)
+				}
+				if index == 14 && (value.Checks["memory"].Current != model.StatusOK || value.Checks["memory"].Notified) {
+					t.Fatal("confirmed recovery did not close the incident")
+				}
+				if err := state.Save(path, value); err != nil {
+					t.Fatal(err)
+				}
+				var err error
+				value, err = state.Load(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func TestRemindersCanBeEnabledIndependently(t *testing.T) {
+	for _, status := range []model.Status{model.StatusWarning, model.StatusCritical} {
+		for _, enabled := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/enabled=%t", status, enabled), func(t *testing.T) {
+				cfg := config.Default()
+				cfg.Agent.WarningFailures = 1
+				cfg.Agent.WarningReminderHours, cfg.Agent.CriticalReminderHours = 1, 1
+				if !enabled {
+					if status == model.StatusWarning {
+						cfg.Agent.WarningReminderHours = 0
+					} else {
+						cfg.Agent.CriticalReminderHours = 0
+					}
+				}
+				value := state.New()
+				now := time.Now().UTC()
+				result := model.Result{ID: "disk", Status: status, Message: "full"}
+				if events := Evaluate(&value, []model.Result{result}, cfg, now); len(events) != 1 {
+					t.Fatalf("initial problem was suppressed: %#v", events)
+				}
+				events := Evaluate(&value, []model.Result{result}, cfg, now.Add(2*time.Hour))
+				if enabled {
+					if len(events) != 1 || events[0].Kind != model.EventReminder {
+						t.Fatalf("configured reminder was suppressed: %#v", events)
+					}
+				} else if len(events) != 0 {
+					t.Fatalf("disabled reminder was sent: %#v", events)
+				}
+			})
+		}
 	}
 }
 
